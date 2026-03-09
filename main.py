@@ -10,12 +10,15 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # ---------- PATHS ----------
+# For Render/Linux, 'ffmpeg' is usually in the PATH. 
+# If you are including the binaries in your repo, keep them as "./ffmpeg"
 FFMPEG = "./ffmpeg"
 FFPROBE = "./ffprobe"
 
 UPLOAD_DIR = "Upload"
 MEME_DIR = "meme"
 OUTPUT_DIR = "."
+RETENTION_TIME = 600  # 10 minutes in seconds
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MEME_DIR, exist_ok=True)
@@ -59,28 +62,62 @@ def ffprobe_has_audio(path):
     )
     return bool(r.stdout.decode().strip())
 
+# ---------- CLEANUP WORKER ----------
+def cleanup_worker():
+    """Background thread that deletes final videos after 10 minutes."""
+    while True:
+        now = time.time()
+        to_delete = []
+        
+        # Check all tasks
+        for task_id, info in list(TASKS.items()):
+            # If the video was finished more than 10 minutes ago
+            if info.get("status") == "done" and info.get("completed_at"):
+                if now - info["completed_at"] > RETENTION_TIME:
+                    file_path = os.path.join(OUTPUT_DIR, info["file"])
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                    to_delete.append(task_id)
+            
+            # Also clean up failed tasks after 10 mins
+            elif info.get("status") == "failed" and now - info["created"] > RETENTION_TIME:
+                to_delete.append(task_id)
+        
+        for tid in to_delete:
+            del TASKS[tid]
+            
+        time.sleep(30) # Run check every 30 seconds
+
+# Start the cleanup thread
+threading.Thread(target=cleanup_worker, daemon=True).start()
+
 # ---------- WORKER ----------
 def process_task(task_id, main_url, meme_url):
+    main_path = f"{UPLOAD_DIR}/main_{task_id}.mp4"
+    meme_path = f"{MEME_DIR}/meme_{task_id}.mp4"
+    fixed_meme = f"{MEME_DIR}/meme_fixed_{task_id}.mp4"
+    output = f"final_{task_id}.mp4"
+    output_full_path = os.path.join(OUTPUT_DIR, output)
+
     try:
         TASKS[task_id]["status"] = "processing"
-
-        main_path = f"{UPLOAD_DIR}/main_{task_id}.mp4"
-        meme_path = f"{MEME_DIR}/meme_{task_id}.mp4"
-        fixed_meme = f"{MEME_DIR}/meme_fixed_{task_id}.mp4"
-        output = f"{OUTPUT_DIR}/final_{task_id}.mp4"
 
         # Download inputs
         download(main_url, main_path)
         download(meme_url, meme_path)
 
         # Get width
-        width = subprocess.check_output([
+        width_output = subprocess.check_output([
             FFPROBE, "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width",
             "-of", "csv=p=0",
             main_path
-        ]).decode().strip() or "720"
+        ]).decode().strip()
+        width = width_output or "720"
 
         # Scale meme to match width
         run_cmd([
@@ -112,21 +149,18 @@ def process_task(task_id, main_url, meme_url):
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
-            output
+            output_full_path
         ]
 
         run_cmd(cmd)
 
-        # Cleanup
-        for f in (main_path, meme_path, fixed_meme):
-            if os.path.exists(f):
-                os.remove(f)
-
+        # Update task with completion time for the 10-minute timer
         TASKS[task_id].update({
             "status": "done",
-            "file": os.path.basename(output),
+            "file": output,
             "has_audio": has_audio,
-            "file_size_bytes": os.path.getsize(output)
+            "file_size_bytes": os.path.getsize(output_full_path),
+            "completed_at": time.time()
         })
 
     except Exception as e:
@@ -134,6 +168,15 @@ def process_task(task_id, main_url, meme_url):
             "status": "failed",
             "error": str(e)
         })
+    
+    finally:
+        # Cleanup temporary files immediately after processing
+        for f in (main_path, meme_path, fixed_meme):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
 # ---------- API ----------
 @app.post("/start")
@@ -163,10 +206,14 @@ def status(task_id: str, request: Request):
     if task.get("status") == "done":
         base = str(request.base_url).rstrip("/")
         task["download_url"] = f"{base}/files/{task['file']}"
+        
+        # Calculate time left for user to download
+        elapsed = time.time() - task.get("completed_at", 0)
+        task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - elapsed))
 
     return task
 
 
 @app.get("/")
 def home():
-    return {"service": "mix-insta-api (python)", "status": "ok"}
+    return {"service": "mix-insta-api (python)", "status": "ok", "auto_cleanup": "10 minutes"}
