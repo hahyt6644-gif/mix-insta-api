@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import subprocess
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -10,20 +11,18 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # ---------- PATHS ----------
-# For Render/Linux, 'ffmpeg' is usually in the PATH. 
-# If you are including the binaries in your repo, keep them as "./ffmpeg"
-FFMPEG = "./ffmpeg"
-FFPROBE = "./ffprobe"
+# Set to "ffmpeg" if using Render's system packages, or "./ffmpeg" if using binaries in repo
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
 
 UPLOAD_DIR = "Upload"
 MEME_DIR = "meme"
 OUTPUT_DIR = "."
-RETENTION_TIME = 600  # 10 minutes in seconds
+RETENTION_TIME = 600  # 10 minutes
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(MEME_DIR, exist_ok=True)
 
-# Serve static files at /files/*
 app.mount("/files", StaticFiles(directory=".", html=False), name="files")
 
 # ---------- TASK STORE ----------
@@ -45,53 +44,64 @@ def run_cmd(cmd, timeout=300):
         check=True
     )
 
+def upload_to_catbox(url):
+    """Fallback: Asks Catbox to mirror the file if the original server blocks us."""
+    try:
+        cmd = [
+            "curl", "-s", 
+            "-F", "reqtype=urlupload", 
+            "-F", "userhash=", 
+            "-F", f"url={url}", 
+            "https://catbox.moe/user/api.php"
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
+        catbox_url = result.stdout.strip()
+        if catbox_url.startswith("https://"):
+            return catbox_url
+    except:
+        pass
+    return None
+
 def download(url, dest):
-    run_cmd(["curl", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
+    """Downloads file with automatic Catbox bypass for Error 52."""
+    try:
+        run_cmd(["curl", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 52:
+            catbox_url = upload_to_catbox(url)
+            if catbox_url:
+                run_cmd(["curl", "-L", "-o", dest, "--silent", "--show-error", catbox_url], timeout=180)
+            else:
+                raise Exception(f"Catbox bypass failed for {url}")
+        else:
+            raise e
 
 def ffprobe_has_audio(path):
     r = subprocess.run(
-        [
-            FFPROBE, "-v", "error",
-            "-select_streams", "a",
-            "-show_entries", "stream=index",
-            "-of", "csv=p=0",
-            path
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     return bool(r.stdout.decode().strip())
 
 # ---------- CLEANUP WORKER ----------
 def cleanup_worker():
-    """Background thread that deletes final videos after 10 minutes."""
     while True:
         now = time.time()
         to_delete = []
-        
-        # Check all tasks
         for task_id, info in list(TASKS.items()):
-            # If the video was finished more than 10 minutes ago
             if info.get("status") == "done" and info.get("completed_at"):
                 if now - info["completed_at"] > RETENTION_TIME:
                     file_path = os.path.join(OUTPUT_DIR, info["file"])
                     if os.path.exists(file_path):
-                        try:
-                            os.remove(file_path)
-                        except:
-                            pass
+                        try: os.remove(file_path)
+                        except: pass
                     to_delete.append(task_id)
-            
-            # Also clean up failed tasks after 10 mins
             elif info.get("status") == "failed" and now - info["created"] > RETENTION_TIME:
                 to_delete.append(task_id)
-        
         for tid in to_delete:
             del TASKS[tid]
-            
-        time.sleep(30) # Run check every 30 seconds
+        time.sleep(30)
 
-# Start the cleanup thread
 threading.Thread(target=cleanup_worker, daemon=True).start()
 
 # ---------- WORKER ----------
@@ -104,57 +114,44 @@ def process_task(task_id, main_url, meme_url):
     try:
         TASKS[task_id]["status"] = "processing"
 
-        # 1. Download inputs
         download(main_url, main_path)
         download(meme_url, meme_path)
 
-        # 2. FFmpeg Filter Logic for 9:16 Shorts (1080x1920)
-        # [0:v] is Main, [1:v] is Meme
-        # We scale both to 1080 width, then overlay them on a black 1080x1920 canvas
+        has_audio_0 = ffprobe_has_audio(main_path)
+        has_audio_1 = ffprobe_has_audio(meme_path)
+
+        # LAYOUT: Meme at Y=0, Main Video shifted down by 250px
         filter_complex = (
-            # Scale main video to 1080 width, keep aspect ratio
             "[0:v]scale=1080:-1[vid];" 
-            # Scale meme to 1080 width
             "[1:v]scale=1080:-1[meme];"
-            # Create a black 9:16 canvas
             "color=s=1080x1920:c=black[bg];"
-            # Put main video in the middle (vertically centered)
-            "[bg][vid]overlay=0:(1920-h)/2[temp];"
-            # Put meme at the very bottom
-            "[temp][meme]overlay=0:0[v];"
-            
-            # Mix audio from both (duration matches the main video)
-            "[0:a][1:a]amix=inputs=2:duration=first[a]"
+            "[bg][meme]overlay=0:0[temp];"
+            "[temp][vid]overlay=0:((1920-h)/2)+250[v]"
         )
 
-        cmd = [
-            FFMPEG, "-y",
-            "-i", main_path,
-            "-i", meme_path,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "[a]",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-shortest", # Ensures video ends when the main content ends
-            output_full_path
-        ]
+        # Dynamic Audio Mixing
+        audio_part = ""
+        if has_audio_0 and has_audio_1:
+            filter_complex += ";[0:a][1:a]amix=inputs=2:duration=first[a]"
+            audio_part = "[a]"
+        elif has_audio_0:
+            audio_part = "0:a"
+        elif has_audio_1:
+            audio_part = "1:a"
+
+        cmd = [FFMPEG, "-y", "-i", main_path, "-i", meme_path, "-filter_complex", filter_complex, "-map", "[v]"]
+        if audio_part:
+            cmd.extend(["-map", audio_part, "-c:a", "aac"])
+        
+        cmd.extend(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-shortest", output_full_path])
 
         run_cmd(cmd)
 
-        TASKS[task_id].update({
-            "status": "done",
-            "file": output,
-            "completed_at": time.time()
-        })
+        TASKS[task_id].update({"status": "done", "file": output, "completed_at": time.time()})
 
     except Exception as e:
         TASKS[task_id].update({"status": "failed", "error": str(e)})
-    
     finally:
-        # Cleanup
         for f in (main_path, meme_path):
             if os.path.exists(f): os.remove(f)
 
@@ -162,38 +159,25 @@ def process_task(task_id, main_url, meme_url):
 @app.post("/start")
 def start(job: Job):
     task_id = str(uuid.uuid4())
-
-    TASKS[task_id] = {
-        "status": "queued",
-        "created": time.time()
-    }
-
-    threading.Thread(
-        target=process_task,
-        args=(task_id, job.main_url, job.meme_url),
-        daemon=True
-    ).start()
-
+    TASKS[task_id] = {"status": "queued", "created": time.time()}
+    threading.Thread(target=process_task, args=(task_id, job.main_url, job.meme_url), daemon=True).start()
     return {"status": "queued", "task_id": task_id}
-
 
 @app.get("/status/{task_id}")
 def status(task_id: str, request: Request):
     task = TASKS.get(task_id)
-    if not task:
-        return {"status": "not_found"}
-
+    if not task: return {"status": "not_found"}
     if task.get("status") == "done":
         base = str(request.base_url).rstrip("/")
         task["download_url"] = f"{base}/files/{task['file']}"
-        
-        # Calculate time left for user to download
         elapsed = time.time() - task.get("completed_at", 0)
         task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - elapsed))
-
     return task
-
 
 @app.get("/")
 def home():
-    return {"service": "mix-insta-api (python)", "status": "ok", "auto_cleanup": "10 minutes"}
+    return {"service": "mix-insta-api", "status": "running", "bypass": "catbox-enabled"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
