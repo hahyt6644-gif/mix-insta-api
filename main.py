@@ -4,11 +4,20 @@ import threading
 import time
 import subprocess
 import uvicorn
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 app = FastAPI()
+
+# ---------- TELEGRAM CREDENTIALS ----------
+# For production, it is highly recommended to store these as Environment Variables on Render
+BOT_TOKEN = "7937328325:AAEOJ3XiyvwZNCVReclkEfpj80BmJoMyngw"
+CHAT_ID = "6931296977"
 
 # ---------- PATHS ----------
 FFMPEG = "./ffmpeg" if os.path.exists("./ffmpeg") else "ffmpeg"
@@ -43,26 +52,50 @@ def run_cmd(cmd, timeout=300):
         check=True
     )
 
-def upload_to_catbox(url):
-    """Fallback: Asks Catbox to mirror the file if the original server blocks us."""
+def download_via_telegram(url, dest):
+    """Fallback: Asks Telegram to fetch the URL, bypass the block, and serve the file."""
+    # 1. Ask Telegram to fetch the video and send it to your chat
+    send_api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'video': url}).encode('utf-8')
+    req = urllib.request.Request(send_api, data=data)
+    
     try:
-        # Removed the empty userhash parameter completely based on API docs!
-        cmd = [
-            "curl", "-s", 
-            "-F", "reqtype=urlupload", 
-            "-F", f"url={url}", 
-            "https://catbox.moe/user/api.php"
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
-        catbox_url = result.stdout.strip()
-        
-        # Catbox returns the raw URL on success. If it fails, it returns an error message.
-        if catbox_url.startswith("https://"):
-            return catbox_url
-        else:
-            raise Exception(f"Catbox API refused the upload. Reason: {catbox_url}")
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        error_info = e.read().decode()
+        raise Exception(f"Telegram API blocked the fetch (File > 20MB or Dead Link): {error_info}")
+    
+    message_id = res_data['result']['message_id']
+    
+    # Check if Telegram saw it as a video or a generic document
+    if 'video' in res_data['result']:
+        file_id = res_data['result']['video']['file_id']
+    elif 'document' in res_data['result']:
+        file_id = res_data['result']['document']['file_id']
+    else:
+        raise Exception("Telegram downloaded the URL but could not process it as a video.")
+
+    # 2. Ask Telegram for the direct download path
+    get_file_api = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+    try:
+        with urllib.request.urlopen(get_file_api) as response:
+            file_data = json.loads(response.read().decode())
+            file_path = file_data['result']['file_path']
     except Exception as e:
-        raise Exception(f"Catbox connection error: {str(e)}")
+        raise Exception(f"Failed to get file path from Telegram: {str(e)}")
+
+    # 3. Download the actual file from Telegram's high-speed servers
+    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", download_url], timeout=180)
+
+    # 4. Clean up your chat instantly so it doesn't get spammed
+    delete_api = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    del_data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'message_id': message_id}).encode('utf-8')
+    try:
+        urllib.request.urlopen(urllib.request.Request(delete_api, data=del_data))
+    except:
+        pass
 
 def is_valid_video(path):
     """Checks if the downloaded file is actually a playable video file."""
@@ -76,31 +109,31 @@ def is_valid_video(path):
         return False
 
 def smart_download(url, dest, label="URL"):
-    """Downloads file and uses Catbox bypass if blocked."""
-    # 1. Try initial download
+    """Downloads file and uses the Telegram Bulletproof Bypass if blocked."""
+    # 1. Try initial direct download (fastest route if no block)
     try:
         run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
     except subprocess.CalledProcessError:
-        pass # Proceed to bypass
+        pass 
     
     # 2. Check if we got a valid video
     if os.path.exists(dest) and is_valid_video(dest):
-        return # Success!
+        return 
         
-    # 3. If invalid or failed, trigger automatic Catbox bypass
+    # 3. If blocked or invalid, trigger Telegram Bypass
     try:
-        catbox_url = upload_to_catbox(url)
-        if catbox_url and catbox_url.startswith("https://"):
-            if os.path.exists(dest):
-                os.remove(dest) # Remove the fake/corrupt file
-            run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", catbox_url], timeout=180)
-            if os.path.exists(dest) and is_valid_video(dest):
-                return # Success via Catbox bypass!
+        if os.path.exists(dest):
+            os.remove(dest) # Remove fake blocked file
+        
+        download_via_telegram(url, dest)
+        
+        if os.path.exists(dest) and is_valid_video(dest):
+            return 
     except Exception as bypass_error:
-        raise Exception(f"{label} bypass failed -> {str(bypass_error)}")
+        raise Exception(f"{label} Telegram bypass failed -> {str(bypass_error)}")
             
     # 4. If everything fails
-    raise Exception(f"{label} error: The host server is blocking downloads from cloud IP addresses.")
+    raise Exception(f"{label} error: The link is dead or the file is too large for Telegram to fetch.")
 
 def ffprobe_has_audio(path):
     try:
@@ -208,7 +241,7 @@ def status(task_id: str, request: Request):
 
 @app.get("/")
 def home():
-    return {"service": "mix-insta-api", "status": "running"}
+    return {"service": "mix-insta-api", "status": "running", "bypass": "telegram-enabled"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
