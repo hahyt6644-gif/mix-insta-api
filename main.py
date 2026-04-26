@@ -121,7 +121,8 @@ def process_task(task_id, main_url, meme_url):
             # Put main video in the middle (vertically centered)
             "[bg][vid]overlay=0:(1920-h)/2[temp];"
             # Put meme at the very bottom
-            "[temp][meme]overlay=0:H-h[v];"
+            "[temp][meme]overlay=0:0[v];"
+            
             # Mix audio from both (duration matches the main video)
             "[0:a][1:a]amix=inputs=2:duration=first[a]"
         )
