@@ -11,9 +11,9 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # ---------- PATHS ----------
-# Set to "ffmpeg" if using Render's system packages, or "./ffmpeg" if using binaries in repo
-FFMPEG = "ffmpeg"
-FFPROBE = "ffprobe"
+# Auto-detects FFmpeg. Uses your local binaries if they exist, otherwise uses Render's system ffmpeg.
+FFMPEG = "./ffmpeg" if os.path.exists("./ffmpeg") else "ffmpeg"
+FFPROBE = "./ffprobe" if os.path.exists("./ffprobe") else "ffprobe"
 
 UPLOAD_DIR = "Upload"
 MEME_DIR = "meme"
@@ -63,25 +63,30 @@ def upload_to_catbox(url):
     return None
 
 def download(url, dest):
-    """Downloads file with automatic Catbox bypass for Error 52."""
+    """Downloads file with an automatic Catbox bypass for Error 52 and HTTP errors."""
     try:
-        run_cmd(["curl", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
+        # Added -f flag to instantly fail if the server returns a 404 or block page
+        run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
     except subprocess.CalledProcessError as e:
-        if e.returncode == 52:
+        # Return code 22 happens with curl -f on HTTP errors. 52 is empty response.
+        if e.returncode in (52, 22):
             catbox_url = upload_to_catbox(url)
             if catbox_url:
-                run_cmd(["curl", "-L", "-o", dest, "--silent", "--show-error", catbox_url], timeout=180)
+                run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", catbox_url], timeout=180)
             else:
                 raise Exception(f"Catbox bypass failed for {url}")
         else:
-            raise e
+            raise Exception(f"Failed to download {url}. Curl exit code: {e.returncode}")
 
 def ffprobe_has_audio(path):
-    r = subprocess.run(
-        [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    return bool(r.stdout.decode().strip())
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        return bool(r.stdout.strip())
+    except:
+        return False
 
 # ---------- CLEANUP WORKER ----------
 def cleanup_worker():
@@ -120,16 +125,16 @@ def process_task(task_id, main_url, meme_url):
         has_audio_0 = ffprobe_has_audio(main_path)
         has_audio_1 = ffprobe_has_audio(meme_path)
 
-        # LAYOUT: Meme at Y=0, Main Video shifted down by 250px
+        # Changed scale=1080:-1 to scale=1080:-2 to prevent libx264 odd-height crashes!
+        # Standardized overlay math syntax to x=...:y=... to prevent parsing errors
         filter_complex = (
-            "[0:v]scale=1080:-1[vid];" 
-            "[1:v]scale=1080:-1[meme];"
+            "[0:v]scale=1080:-2[vid];" 
+            "[1:v]scale=1080:-2[meme];"
             "color=s=1080x1920:c=black[bg];"
-            "[bg][meme]overlay=0:0[temp];"
-            "[temp][vid]overlay=0:((1920-h)/2)+250[v]"
+            "[bg][meme]overlay=x=0:y=0[temp];"
+            "[temp][vid]overlay=x=0:y=(1920-h)/2+250[v]"
         )
 
-        # Dynamic Audio Mixing
         audio_part = ""
         if has_audio_0 and has_audio_1:
             filter_complex += ";[0:a][1:a]amix=inputs=2:duration=first[a]"
@@ -149,6 +154,12 @@ def process_task(task_id, main_url, meme_url):
 
         TASKS[task_id].update({"status": "done", "file": output, "completed_at": time.time()})
 
+    except subprocess.CalledProcessError as e:
+        # If it crashes again, grab the actual console logs from FFmpeg so we can see the exact error
+        error_msg = e.stdout if e.stdout else str(e)
+        if len(error_msg) > 1000:
+            error_msg = "..." + error_msg[-1000:] # Show only the end of the log where the error is
+        TASKS[task_id].update({"status": "failed", "error": error_msg})
     except Exception as e:
         TASKS[task_id].update({"status": "failed", "error": str(e)})
     finally:
