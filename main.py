@@ -46,20 +46,23 @@ def run_cmd(cmd, timeout=300):
 def upload_to_catbox(url):
     """Fallback: Asks Catbox to mirror the file if the original server blocks us."""
     try:
+        # Removed the empty userhash parameter completely based on API docs!
         cmd = [
             "curl", "-s", 
             "-F", "reqtype=urlupload", 
-            "-F", "userhash=", 
             "-F", f"url={url}", 
             "https://catbox.moe/user/api.php"
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=True)
         catbox_url = result.stdout.strip()
+        
+        # Catbox returns the raw URL on success. If it fails, it returns an error message.
         if catbox_url.startswith("https://"):
             return catbox_url
-    except:
-        pass
-    return None
+        else:
+            raise Exception(f"Catbox API refused the upload. Reason: {catbox_url}")
+    except Exception as e:
+        raise Exception(f"Catbox connection error: {str(e)}")
 
 def is_valid_video(path):
     """Checks if the downloaded file is actually a playable video file."""
@@ -73,7 +76,7 @@ def is_valid_video(path):
         return False
 
 def smart_download(url, dest, label="URL"):
-    """Downloads file and uses Catbox bypass if blocked (curl error or invalid video file)."""
+    """Downloads file and uses Catbox bypass if blocked."""
     # 1. Try initial download
     try:
         run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
@@ -85,19 +88,19 @@ def smart_download(url, dest, label="URL"):
         return # Success!
         
     # 3. If invalid or failed, trigger automatic Catbox bypass
-    catbox_url = upload_to_catbox(url)
-    if catbox_url:
-        if os.path.exists(dest):
-            os.remove(dest) # Remove the fake/corrupt file
-        try:
+    try:
+        catbox_url = upload_to_catbox(url)
+        if catbox_url and catbox_url.startswith("https://"):
+            if os.path.exists(dest):
+                os.remove(dest) # Remove the fake/corrupt file
             run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", catbox_url], timeout=180)
             if os.path.exists(dest) and is_valid_video(dest):
                 return # Success via Catbox bypass!
-        except:
-            pass
+    except Exception as bypass_error:
+        raise Exception(f"{label} bypass failed -> {str(bypass_error)}")
             
-    # 4. If even Catbox fails
-    raise Exception(f"{label} error: The site blocked the download and the automatic Catbox bypass failed. The video might be private or removed.")
+    # 4. If everything fails
+    raise Exception(f"{label} error: The host server is blocking downloads from cloud IP addresses.")
 
 def ffprobe_has_audio(path):
     try:
@@ -140,7 +143,6 @@ def process_task(task_id, main_url, meme_url):
     try:
         TASKS[task_id]["status"] = "processing"
 
-        # The smart_download will now automatically bounce to Catbox if the file is blocked or fake
         smart_download(main_url, main_path, "MAIN_URL")
         smart_download(meme_url, meme_path, "MEME_URL")
 
