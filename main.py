@@ -11,7 +11,6 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # ---------- PATHS ----------
-# Auto-detects FFmpeg. Uses your local binaries if they exist, otherwise uses Render's system ffmpeg.
 FFMPEG = "./ffmpeg" if os.path.exists("./ffmpeg") else "ffmpeg"
 FFPROBE = "./ffprobe" if os.path.exists("./ffprobe") else "ffprobe"
 
@@ -65,10 +64,8 @@ def upload_to_catbox(url):
 def download(url, dest):
     """Downloads file with an automatic Catbox bypass for Error 52 and HTTP errors."""
     try:
-        # Added -f flag to instantly fail if the server returns a 404 or block page
         run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
     except subprocess.CalledProcessError as e:
-        # Return code 22 happens with curl -f on HTTP errors. 52 is empty response.
         if e.returncode in (52, 22):
             catbox_url = upload_to_catbox(url)
             if catbox_url:
@@ -77,6 +74,17 @@ def download(url, dest):
                 raise Exception(f"Catbox bypass failed for {url}")
         else:
             raise Exception(f"Failed to download {url}. Curl exit code: {e.returncode}")
+
+def is_valid_video(path):
+    """Checks if the downloaded file is actually a playable video file."""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        return bool(r.stdout.strip())
+    except:
+        return False
 
 def ffprobe_has_audio(path):
     try:
@@ -119,14 +127,19 @@ def process_task(task_id, main_url, meme_url):
     try:
         TASKS[task_id]["status"] = "processing"
 
+        # 1. Download & Validate Main Video
         download(main_url, main_path)
+        if not is_valid_video(main_path):
+            raise Exception("MAIN_URL error: The host site blocked the download or sent an invalid file instead of a video. Please upload the main video directly to Catbox.moe and use that link.")
+
+        # 2. Download & Validate Meme Video
         download(meme_url, meme_path)
+        if not is_valid_video(meme_path):
+            raise Exception("MEME_URL error: The host site blocked the download or sent an invalid file instead of a video. Please upload the meme directly to Catbox.moe and use that link.")
 
         has_audio_0 = ffprobe_has_audio(main_path)
         has_audio_1 = ffprobe_has_audio(meme_path)
 
-        # Changed scale=1080:-1 to scale=1080:-2 to prevent libx264 odd-height crashes!
-        # Standardized overlay math syntax to x=...:y=... to prevent parsing errors
         filter_complex = (
             "[0:v]scale=1080:-2[vid];" 
             "[1:v]scale=1080:-2[meme];"
@@ -155,11 +168,10 @@ def process_task(task_id, main_url, meme_url):
         TASKS[task_id].update({"status": "done", "file": output, "completed_at": time.time()})
 
     except subprocess.CalledProcessError as e:
-        # If it crashes again, grab the actual console logs from FFmpeg so we can see the exact error
         error_msg = e.stdout if e.stdout else str(e)
         if len(error_msg) > 1000:
-            error_msg = "..." + error_msg[-1000:] # Show only the end of the log where the error is
-        TASKS[task_id].update({"status": "failed", "error": error_msg})
+            error_msg = "..." + error_msg[-1000:]
+        TASKS[task_id].update({"status": "failed", "error": f"FFmpeg Error: {error_msg}"})
     except Exception as e:
         TASKS[task_id].update({"status": "failed", "error": str(e)})
     finally:
@@ -187,7 +199,7 @@ def status(task_id: str, request: Request):
 
 @app.get("/")
 def home():
-    return {"service": "mix-insta-api", "status": "running", "bypass": "catbox-enabled"}
+    return {"service": "mix-insta-api", "status": "running"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
