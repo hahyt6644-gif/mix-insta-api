@@ -96,16 +96,16 @@ def transcribe_audio(audio_path):
     with open(audio_path, "rb") as f:
         r = requests.post(
             "https://transcription.itz-dev.workers.dev/",
-            data=f.read(),
+            files={"file": f},
             timeout=300
         )
 
-    data = r.json()
+    try:
+        data = r.json()
+    except:
+        data = json.loads(r.text.split("~")[0])
 
-    if "text" not in data:
-        raise Exception("Transcription failed")
-
-    return data["text"]
+    return data.get("text", "")
 
 
 def generate_voice(
@@ -153,7 +153,8 @@ def speed_audio(input_audio, output_audio, speed):
         f"atempo={speed}",
         output_audio
     ]) 
-    # ---------- VIDEO HELPERS ----------
+
+# ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
     """
     speed < 1.0 = slow
@@ -389,7 +390,7 @@ def process_duration_logic(task_id, video_path, voice_audio):
 
         return final_video, sped_audio
 
-# ---------- CASE 2 ----------
+    # ---------- CASE 2 ----------
     # video longer
     else:
 
@@ -607,17 +608,17 @@ def process_task(
 
         # duration logic
         final_video, final_audio = process_duration_logic(
-    task_id,
-    main_video,
-    generated_audio
-)
+            task_id,
+            main_video,
+            generated_audio
+        )
 
         # merge final
         merge_audio_video(
-    final_video,
-    final_audio,
-    final_output
-)
+            final_video,
+            final_audio,
+            final_output
+        )
 
         TASKS[
             task_id
@@ -773,4 +774,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-    
