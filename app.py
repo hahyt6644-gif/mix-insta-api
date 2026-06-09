@@ -252,7 +252,6 @@ def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, targe
         FFMPEG,
         "-y",
         "-threads", "1",            # Force single-threaded scaling
-        "-syncpoints", "1",         # Low-memory synchronization flag
         "-i", video_path,
         "-stream_loop", "-1",       
         "-i", pre_scaled_avatar_path,
@@ -264,7 +263,6 @@ def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, targe
         "-c:v", "libx264",
         "-preset", "ultrafast",     
         "-crf", "30",               # Slightly higher compression to save server RAM allocation
-        "-rc-lookahead", "0",       # Strips frame caching arrays from memory
         "-r", "30",                 
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
