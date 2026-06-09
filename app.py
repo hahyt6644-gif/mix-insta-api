@@ -29,7 +29,7 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 # ---------- TASK STORE & LOCK ----------
 TASKS = {}
-# Limits processing to 1 job at a time to prevent Render memory crashes
+# Limits processing to 1 job at a time to strictly protect Render RAM
 JOB_LOCK = threading.Semaphore(1)
 
 # ---------- INPUT ----------
@@ -77,7 +77,6 @@ def get_duration(path):
         stderr=subprocess.PIPE,
         text=True
     )
-
     try:
         return float(r.stdout.strip())
     except:
@@ -111,6 +110,7 @@ def extract_audio(video_path, out_audio):
     run_cmd([
         FFMPEG,
         "-y",
+        "-threads", "1",
         "-i", video_path,
         "-vn",
         "-acodec", "mp3",
@@ -125,25 +125,16 @@ def transcribe_audio(audio_path):
             files={"file": f},
             timeout=300
         )
-
     try:
         data = r.json()
     except:
         data = json.loads(r.text.split("~")[0])
-
     return data.get("text", "")
 
 
-def generate_voice(
-    voice_api,
-    transcript,
-    ref_audio_path
-):
+def generate_voice(voice_api, transcript, ref_audio_path):
     with open(ref_audio_path, "rb") as f:
-        files = {
-            "ref_audio": f
-        }
-
+        files = {"ref_audio": f}
         data = {
             "text": transcript,
             "language": "Hindi",
@@ -154,19 +145,11 @@ def generate_voice(
             "preprocess_prompt": "true",
             "postprocess_output": "true"
         }
-
-        r = requests.post(
-            voice_api,
-            files=files,
-            data=data,
-            timeout=600
-        )
+        r = requests.post(voice_api, files=files, data=data, timeout=600)
 
     j = r.json()
-
     if not j.get("success"):
         raise Exception("Voice generation failed")
-
     return j["audio_url"]
 
 
@@ -174,11 +157,12 @@ def speed_audio(input_audio, output_audio, speed):
     run_cmd([
         FFMPEG,
         "-y",
+        "-threads", "1",
         "-i", input_audio,
-        "-filter:a",
-        f"atempo={speed}",
+        "-filter:a", f"atempo={speed}",
         output_audio
     ]) 
+
 
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
@@ -188,11 +172,11 @@ def speed_video(input_video, output_video, speed):
         "-y",
         "-threads", "1",
         "-i", input_video,
-        "-filter:v",
-        f"setpts={setpts}*PTS",
+        "-filter:v", f"setpts={setpts}*PTS",
         "-an",
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-crf", "32",
         "-pix_fmt", "yuv420p",
         output_video
     ])
@@ -209,6 +193,7 @@ def trim_video(input_path, start, duration, output_path):
         "-an",
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-crf", "32",
         "-pix_fmt", "yuv420p",
         output_path
     ])
@@ -216,7 +201,6 @@ def trim_video(input_path, start, duration, output_path):
 
 def concat_videos(video_list, output_path):
     txt_path = output_path + ".txt"
-
     with open(txt_path, "w") as f:
         for v in video_list:
             f.write(f"file '{os.path.abspath(v)}'\n")
@@ -230,52 +214,61 @@ def concat_videos(video_list, output_path):
         "-i", txt_path,
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-crf", "32",
         "-pix_fmt", "yuv420p",
         output_path
     ])
-
     try:
         os.remove(txt_path)
     except:
         pass
 
 
-def merge_avatar_and_audio(video_path, avatar_path, audio_path, output_path):
-    width, height = get_dimensions(video_path)
-    
-    # --- MEMORY SAVER LOGIC (Max 720p) ---
-    if height > 1280:
-        ratio = 1280 / height
-        width = int(width * ratio)
-        height = 1280
+# ---------- NEW LOW-RAM PRE-PROCESSING HELPERS ----------
+def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
+    """Shrinks avatar immediately after downloading to prevent decoding spikes later"""
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-threads", "1",
+        "-i", avatar_path,
+        "-vf", f"scale={target_w}:{target_h}",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "32",
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ])
 
-    # Ensure dimensions are even numbers for strict H.264 layout compliance
-    target_width = (width // 2) * 2
-    target_height = (height // 4) * 2
-    
+
+def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, target_width, target_height, final_height, output_path):
     main_w = target_width
-    main_h = (height // 2) * 2
+    main_h = final_height
     overlay_y = main_h - target_height
 
     cmd = [
         FFMPEG,
         "-y",
-        "-threads", "1",            # Keeps RAM low
+        "-threads", "1",            # Force single-threaded scaling
+        "-syncpoints", "1",         # Low-memory synchronization flag
         "-i", video_path,
-        "-stream_loop", "-1",       # Infinitely loop avatar
-        "-i", avatar_path,
+        "-stream_loop", "-1",       
+        "-i", pre_scaled_avatar_path,
         "-i", audio_path,
         "-filter_complex", 
-        f"[0:v]scale={main_w}:{main_h}[main];[1:v]scale={target_width}:{target_height}[sub];[main][sub]overlay=0:{overlay_y}[outv]",
+        f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=0:{overlay_y}[outv]",
         "-map", "[outv]",
         "-map", "2:a",
         "-c:v", "libx264",
         "-preset", "ultrafast",     
-        "-crf", "28",               
-        "-r", "30",                 # Limit to 30 FPS to prevent RAM spikes
+        "-crf", "30",               # Slightly higher compression to save server RAM allocation
+        "-rc-lookahead", "0",       # Strips frame caching arrays from memory
+        "-r", "30",                 
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-shortest",                # Crop perfectly to audio length
+        "-shortest",                
         output_path
     ]
     run_cmd(cmd)
@@ -319,7 +312,6 @@ def process_duration_logic(task_id, video_path, voice_audio):
             trim_video(slowed_video, 0, final_audio_duration, trimmed)
             return trimmed, sped_audio
 
-        # filler logic
         missing = final_audio_duration - slowed_duration
         last5_start = max(0, slowed_duration - 5)
 
@@ -363,6 +355,7 @@ def process_duration_logic(task_id, video_path, voice_audio):
 
         return final_video, voice_audio
        
+
 # ---------- CLEANUP ----------
 def cleanup_worker():
     while True:
@@ -401,10 +394,7 @@ def cleanup_worker():
         time.sleep(30)
 
 
-threading.Thread(
-    target=cleanup_worker,
-    daemon=True
-).start()
+threading.Thread(target=cleanup_worker, daemon=True).start()
 
 
 # ---------- WORKER ----------
@@ -414,46 +404,68 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 
     main_video = os.path.join(task_folder, "main.mp4")
     ref_audio = os.path.join(task_folder, "ref.mp3")
-    new_avatar = os.path.join(task_folder, "avatar.mp4")
+    raw_avatar = os.path.join(task_folder, "raw_avatar.mp4")
+    scaled_avatar = os.path.join(task_folder, "scaled_avatar.mp4")
     extracted_audio = os.path.join(task_folder, "extract.mp3")
     generated_audio = os.path.join(task_folder, "generated.wav")
     output_name = f"final_{task_id}.mp4"
     final_output = os.path.join(OUTPUT_DIR, output_name)
 
     try:
-        # Step 1: Wait in queue if server is busy
         TASKS[task_id]["status"] = "waiting_in_queue"
 
-        # Step 2: Acquire lock to protect Render RAM
         with JOB_LOCK:
             TASKS[task_id]["status"] = "processing"
 
-            # Download files
+            # Download assets
             smart_download(main_url, main_video)
             smart_download(ref_audio_url, ref_audio)
-            smart_download(new_avatar_url, new_avatar)
+            smart_download(new_avatar_url, raw_avatar)
 
-            # Extract & Transcribe
+            # --- DYNAMIC LOW-RAM DIMENSION MATH (Target 540p Vertical) ---
+            width, height = get_dimensions(main_video)
+            if height > 960:
+                ratio = 960 / height
+                width = int(width * ratio)
+                height = 960
+
+            target_width = (width // 2) * 2
+            target_height = (height // 4) * 2
+            final_height = (height // 2) * 2
+
+            # Step 1: Pre-scale avatar to tiny dimension sequentially
+            pre_scale_avatar(raw_avatar, target_width, target_height, scaled_avatar)
+            
+            # Remove high resolution raw avatar from folder to keep disk footprint small
+            try:
+                os.remove(raw_avatar)
+            except:
+                pass
+
+            # Step 2: Extract & Transcribe
             extract_audio(main_video, extracted_audio)
             transcript = transcribe_audio(extracted_audio)
             TASKS[task_id]["transcript"] = transcript
 
-            # Generate Voice
+            # Step 3: Generate Voice
             voice_url = generate_voice(voice_api, transcript, ref_audio)
             smart_download(voice_url, generated_audio)
 
-            # Duration Logic
+            # Step 4: Video timing / padding adjustment
             final_video, final_audio = process_duration_logic(
                 task_id,
                 main_video,
                 generated_audio
             )
 
-            # Merge final with custom avatar layout overlay
+            # Step 5: Merge pre-scaled avatar and final layout sequence
             merge_avatar_and_audio(
                 final_video,
-                new_avatar,
+                scaled_avatar,
                 final_audio,
+                target_width,
+                target_height,
+                final_height,
                 final_output
             )
 
@@ -480,7 +492,6 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 @app.post("/start")
 def start(job: Job):
     task_id = str(uuid.uuid4())
-
     TASKS[task_id] = {
         "status": "queued",
         "created": time.time()
@@ -507,14 +518,12 @@ def start(job: Job):
 @app.get("/status/{task_id}")
 def status(task_id: str, request: Request):
     task = TASKS.get(task_id)
-
     if not task:
         return {"status": "not_found"}
 
     if task.get("status") == "done":
         base = str(request.base_url).rstrip("/")
         task["download_url"] = f"{base}/files/{task['file']}"
-        
         elapsed = time.time() - task.get("completed_at", 0)
         task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - elapsed))
 
