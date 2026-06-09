@@ -606,21 +606,18 @@ def process_task(
         )
 
         # duration logic
-        final_video,
-        final_audio = (
-            process_duration_logic(
-                task_id,
-                main_video,
-                generated_audio
-            )
-        )
+        final_video, final_audio = process_duration_logic(
+    task_id,
+    main_video,
+    generated_audio
+)
 
         # merge final
         merge_audio_video(
-            final_video,
-            final_audio,
-            final_output
-        )
+    final_video,
+    final_audio,
+    final_output
+)
 
         TASKS[
             task_id
