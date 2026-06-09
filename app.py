@@ -27,8 +27,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
-# ---------- TASK STORE ----------
+# ---------- TASK STORE & LOCK ----------
 TASKS = {}
+# Limits processing to 1 job at a time to prevent Render memory crashes
+JOB_LOCK = threading.Semaphore(1)
 
 # ---------- INPUT ----------
 class Job(BaseModel):
@@ -180,15 +182,11 @@ def speed_audio(input_audio, output_audio, speed):
 
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
-    """
-    speed < 1.0 = slow
-    speed > 1.0 = fast
-    """
     setpts = 1 / speed
-
     run_cmd([
         FFMPEG,
         "-y",
+        "-threads", "1",
         "-i", input_video,
         "-filter:v",
         f"setpts={setpts}*PTS",
@@ -204,6 +202,7 @@ def trim_video(input_path, start, duration, output_path):
     run_cmd([
         FFMPEG,
         "-y",
+        "-threads", "1",
         "-ss", str(start),
         "-i", input_path,
         "-t", str(duration),
@@ -225,6 +224,7 @@ def concat_videos(video_list, output_path):
     run_cmd([
         FFMPEG,
         "-y",
+        "-threads", "1",
         "-f", "concat",
         "-safe", "0",
         "-i", txt_path,
@@ -243,57 +243,55 @@ def concat_videos(video_list, output_path):
 def merge_avatar_and_audio(video_path, avatar_path, audio_path, output_path):
     width, height = get_dimensions(video_path)
     
+    # --- MEMORY SAVER LOGIC (Max 720p) ---
+    if height > 1280:
+        ratio = 1280 / height
+        width = int(width * ratio)
+        height = 1280
+
     # Ensure dimensions are even numbers for strict H.264 layout compliance
     target_width = (width // 2) * 2
     target_height = (height // 4) * 2
-    overlay_y = height - target_height
+    
+    main_w = target_width
+    main_h = (height // 2) * 2
+    overlay_y = main_h - target_height
 
     cmd = [
         FFMPEG,
         "-y",
+        "-threads", "1",            # Keeps RAM low
         "-i", video_path,
-        "-stream_loop", "-1",       # Infinitely loop avatar if shorter than main video
+        "-stream_loop", "-1",       # Infinitely loop avatar
         "-i", avatar_path,
         "-i", audio_path,
-        "-filter_complex", f"[1:v]scale={target_width}:{target_height}[sub];[0:v][sub]overlay=0:{overlay_y}[outv]",
+        "-filter_complex", 
+        f"[0:v]scale={main_w}:{main_h}[main];[1:v]scale={target_width}:{target_height}[sub];[main][sub]overlay=0:{overlay_y}[outv]",
         "-map", "[outv]",
-        "-map", "2:a",              # Map the newly generated voice track
+        "-map", "2:a",
         "-c:v", "libx264",
-        "-preset", "ultrafast",
+        "-preset", "ultrafast",     
+        "-crf", "28",               
+        "-r", "30",                 # Limit to 30 FPS to prevent RAM spikes
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-shortest",                # Automatically crop video output precisely to audio track length
+        "-shortest",                # Crop perfectly to audio length
         output_path
     ]
     run_cmd(cmd)
 
 
 def process_duration_logic(task_id, video_path, voice_audio):
-    """
-    Main timing logic:
-    - preserve last 5 sec
-    - slow video first (0.85–0.95)
-    - speed audio second (1.0–1.10)
-    - filler clip if needed
-    """
-
-    temp_dir = os.path.join(
-        UPLOAD_DIR,
-        task_id
-    )
-
+    temp_dir = os.path.join(UPLOAD_DIR, task_id)
     os.makedirs(temp_dir, exist_ok=True)
 
     video_duration = get_duration(video_path)
     audio_duration = get_duration(voice_audio)
 
-    # ---------- CASE 1 ----------
-    # audio longer
+    # ---------- CASE 1: Audio longer ----------
     if audio_duration > video_duration:
-
         gap_ratio = audio_duration / video_duration
 
-        # dynamic video slow
         if gap_ratio >= 1.35:
             vid_speed = 0.85
         elif gap_ratio >= 1.20:
@@ -303,138 +301,45 @@ def process_duration_logic(task_id, video_path, voice_audio):
         else:
             vid_speed = 0.95
 
-        slowed_video = os.path.join(
-            temp_dir,
-            "slowed.mp4"
-        )
+        slowed_video = os.path.join(temp_dir, "slowed.mp4")
+        speed_video(video_path, slowed_video, vid_speed)
+        slowed_duration = get_duration(slowed_video)
 
-        speed_video(
-            video_path,
-            slowed_video,
-            vid_speed
-        )
+        remaining_gap = audio_duration / slowed_duration
+        audio_speed = min(1.10, max(1.0, remaining_gap))
 
-        slowed_duration = get_duration(
-            slowed_video
-        )
+        sped_audio = os.path.join(temp_dir, "audio_sped.mp3")
+        speed_audio(voice_audio, sped_audio, audio_speed)
+        
+        final_audio_duration = get_duration(sped_audio)
+        slowed_duration = get_duration(slowed_video)
 
-        # dynamic audio speed
-        remaining_gap = (
-            audio_duration /
-            slowed_duration
-        )
-
-        audio_speed = min(
-            1.10,
-            max(1.0, remaining_gap)
-        )
-
-        sped_audio = os.path.join(
-            temp_dir,
-            "audio_sped.mp3"
-        )
-
-        speed_audio(
-            voice_audio,
-            sped_audio,
-            audio_speed
-        )
-
-        final_audio_duration = get_duration(
-            sped_audio
-        )
-
-        slowed_duration = get_duration(
-            slowed_video
-        )
-
-        # already enough
         if slowed_duration >= final_audio_duration:
-            trimmed = os.path.join(
-                temp_dir,
-                "trimmed.mp4"
-            )
-
-            trim_video(
-                slowed_video,
-                0,
-                final_audio_duration,
-                trimmed
-            )
-
+            trimmed = os.path.join(temp_dir, "trimmed.mp4")
+            trim_video(slowed_video, 0, final_audio_duration, trimmed)
             return trimmed, sped_audio
 
-        # ---------- filler logic ----------
-        missing = (
-            final_audio_duration -
-            slowed_duration
-        )
+        # filler logic
+        missing = final_audio_duration - slowed_duration
+        last5_start = max(0, slowed_duration - 5)
 
-        last5_start = max(
-            0,
-            slowed_duration - 5
-        )
+        before_last = os.path.join(temp_dir, "before_last.mp4")
+        trim_video(slowed_video, 0, last5_start, before_last)
 
-        before_last = os.path.join(
-            temp_dir,
-            "before_last.mp4"
-        )
+        filler = os.path.join(temp_dir, "filler.mp4")
+        trim_video(slowed_video, 0, missing, filler)
 
-        trim_video(
-            slowed_video,
-            0,
-            last5_start,
-            before_last
-        )
+        last5 = os.path.join(temp_dir, "last5.mp4")
+        trim_video(slowed_video, last5_start, 5, last5)
 
-        filler = os.path.join(
-            temp_dir,
-            "filler.mp4"
-        )
-
-        trim_video(
-            slowed_video,
-            0,
-            missing,
-            filler
-        )
-
-        last5 = os.path.join(
-            temp_dir,
-            "last5.mp4"
-        )
-
-        trim_video(
-            slowed_video,
-            last5_start,
-            5,
-            last5
-        )
-
-        final_video = os.path.join(
-            temp_dir,
-            "video_ready.mp4"
-        )
-
-        concat_videos(
-            [
-                before_last,
-                filler,
-                last5
-            ],
-            final_video
-        )
+        final_video = os.path.join(temp_dir, "video_ready.mp4")
+        concat_videos([before_last, filler, last5], final_video)
 
         return final_video, sped_audio
 
-    # ---------- CASE 2 ----------
-    # video longer
+    # ---------- CASE 2: Video longer ----------
     else:
-
-        ratio = (
-            video_duration /
-            audio_duration
-        )
+        ratio = video_duration / audio_duration
 
         if ratio >= 1.30:
             vid_speed = 1.10
@@ -445,38 +350,15 @@ def process_duration_logic(task_id, video_path, voice_audio):
         else:
             vid_speed = 1.02
 
-        sped_video = os.path.join(
-            temp_dir,
-            "sped_video.mp4"
-        )
+        sped_video = os.path.join(temp_dir, "sped_video.mp4")
+        speed_video(video_path, sped_video, vid_speed)
+        sped_duration = get_duration(sped_video)
 
-        speed_video(
-            video_path,
-            sped_video,
-            vid_speed
-        )
+        final_video = os.path.join(temp_dir, "trimmed_final.mp4")
 
-        sped_duration = get_duration(
-            sped_video
-        )
-
-        final_video = os.path.join(
-            temp_dir,
-            "trimmed_final.mp4"
-        )
-
-        # if sped video still longer → trim
         if sped_duration > audio_duration:
-
-            trim_video(
-                sped_video,
-                0,
-                audio_duration,
-                final_video
-            )
-
+            trim_video(sped_video, 0, audio_duration, final_video)
         else:
-            # already shorter or exact
             final_video = sped_video
 
         return final_video, voice_audio
@@ -488,48 +370,25 @@ def cleanup_worker():
         to_delete = []
 
         for task_id, info in list(TASKS.items()):
-
-            if (
-                info.get("status") == "done"
-                and info.get("completed_at")
-            ):
-
-                elapsed = (
-                    now -
-                    info["completed_at"]
-                )
+            if info.get("status") == "done" and info.get("completed_at"):
+                elapsed = now - info["completed_at"]
 
                 if elapsed > RETENTION_TIME:
-
-                    file_path = os.path.join(
-                        OUTPUT_DIR,
-                        info["file"]
-                    )
-
+                    file_path = os.path.join(OUTPUT_DIR, info["file"])
                     try:
                         if os.path.exists(file_path):
                             os.remove(file_path)
                     except:
                         pass
 
-                    task_folder = os.path.join(
-                        UPLOAD_DIR,
-                        task_id
-                    )
-
+                    task_folder = os.path.join(UPLOAD_DIR, task_id)
                     try:
                         if os.path.exists(task_folder):
                             for f in os.listdir(task_folder):
                                 try:
-                                    os.remove(
-                                        os.path.join(
-                                            task_folder,
-                                            f
-                                        )
-                                    )
+                                    os.remove(os.path.join(task_folder, f))
                                 except:
                                     pass
-
                             os.rmdir(task_folder)
                     except:
                         pass
@@ -549,181 +408,82 @@ threading.Thread(
 
 
 # ---------- WORKER ----------
-def process_task(
-    task_id,
-    main_url,
-    ref_audio_url,
-    voice_api,
-    new_avatar_url
-):
+def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
+    task_folder = os.path.join(UPLOAD_DIR, task_id)
+    os.makedirs(task_folder, exist_ok=True)
 
-    task_folder = os.path.join(
-        UPLOAD_DIR,
-        task_id
-    )
-
-    os.makedirs(
-        task_folder,
-        exist_ok=True
-    )
-
-    main_video = os.path.join(
-        task_folder,
-        "main.mp4"
-    )
-
-    ref_audio = os.path.join(
-        task_folder,
-        "ref.mp3"
-    )
-
-    new_avatar = os.path.join(
-        task_folder,
-        "avatar.mp4"
-    )
-
-    extracted_audio = os.path.join(
-        task_folder,
-        "extract.mp3"
-    )
-
-    generated_audio = os.path.join(
-        task_folder,
-        "generated.wav"
-    )
-
-    output_name = (
-        f"final_{task_id}.mp4"
-    )
-
-    final_output = os.path.join(
-        OUTPUT_DIR,
-        output_name
-    )
+    main_video = os.path.join(task_folder, "main.mp4")
+    ref_audio = os.path.join(task_folder, "ref.mp3")
+    new_avatar = os.path.join(task_folder, "avatar.mp4")
+    extracted_audio = os.path.join(task_folder, "extract.mp3")
+    generated_audio = os.path.join(task_folder, "generated.wav")
+    output_name = f"final_{task_id}.mp4"
+    final_output = os.path.join(OUTPUT_DIR, output_name)
 
     try:
+        # Step 1: Wait in queue if server is busy
+        TASKS[task_id]["status"] = "waiting_in_queue"
 
-        TASKS[task_id][
-            "status"
-        ] = "processing"
+        # Step 2: Acquire lock to protect Render RAM
+        with JOB_LOCK:
+            TASKS[task_id]["status"] = "processing"
 
-        # download files
-        smart_download(
-            main_url,
-            main_video
-        )
+            # Download files
+            smart_download(main_url, main_video)
+            smart_download(ref_audio_url, ref_audio)
+            smart_download(new_avatar_url, new_avatar)
 
-        smart_download(
-            ref_audio_url,
-            ref_audio
-        )
+            # Extract & Transcribe
+            extract_audio(main_video, extracted_audio)
+            transcript = transcribe_audio(extracted_audio)
+            TASKS[task_id]["transcript"] = transcript
 
-        smart_download(
-            new_avatar_url,
-            new_avatar
-        )
+            # Generate Voice
+            voice_url = generate_voice(voice_api, transcript, ref_audio)
+            smart_download(voice_url, generated_audio)
 
-        # extract main audio
-        extract_audio(
-            main_video,
-            extracted_audio
-        )
-
-        # transcription
-        transcript = (
-            transcribe_audio(
-                extracted_audio
+            # Duration Logic
+            final_video, final_audio = process_duration_logic(
+                task_id,
+                main_video,
+                generated_audio
             )
-        )
 
-        TASKS[task_id][
-            "transcript"
-        ] = transcript
-
-        # generate voice
-        voice_url = (
-            generate_voice(
-                voice_api,
-                transcript,
-                ref_audio
+            # Merge final with custom avatar layout overlay
+            merge_avatar_and_audio(
+                final_video,
+                new_avatar,
+                final_audio,
+                final_output
             )
-        )
 
-        smart_download(
-            voice_url,
-            generated_audio
-        )
-
-        # duration logic
-        final_video, final_audio = process_duration_logic(
-            task_id,
-            main_video,
-            generated_audio
-        )
-
-        # merge final with custom avatar layout overlay
-        merge_avatar_and_audio(
-            final_video,
-            new_avatar,
-            final_audio,
-            final_output
-        )
-
-        TASKS[
-            task_id
-        ].update({
-            "status":
-            "done",
-            "file":
-            output_name,
-            "completed_at":
-            time.time()
-        })
+            TASKS[task_id].update({
+                "status": "done",
+                "file": output_name,
+                "completed_at": time.time()
+            })
 
     except subprocess.CalledProcessError as e:
-
-        error_msg = (
-            e.stdout
-            if e.stdout
-            else str(e)
-        )
-
-        TASKS[
-            task_id
-        ].update({
-            "status":
-            "failed",
-            "error":
-            error_msg[-1500:]
+        error_msg = e.stdout if e.stdout else str(e)
+        TASKS[task_id].update({
+            "status": "failed",
+            "error": error_msg[-1500:]
         })
-
     except Exception as e:
-
-        TASKS[
-            task_id
-        ].update({
-            "status":
-            "failed",
-            "error":
-            str(e)
+        TASKS[task_id].update({
+            "status": "failed",
+            "error": str(e)
         })
 
 
 # ---------- API ----------
 @app.post("/start")
 def start(job: Job):
+    task_id = str(uuid.uuid4())
 
-    task_id = str(
-        uuid.uuid4()
-    )
-
-    TASKS[
-        task_id
-    ] = {
-        "status":
-        "queued",
-        "created":
-        time.time()
+    TASKS[task_id] = {
+        "status": "queued",
+        "created": time.time()
     }
 
     threading.Thread(
@@ -739,63 +499,24 @@ def start(job: Job):
     ).start()
 
     return {
-        "status":
-        "queued",
-        "task_id":
-        task_id
+        "status": "queued",
+        "task_id": task_id
     }
 
 
 @app.get("/status/{task_id}")
-def status(
-    task_id: str,
-    request: Request
-):
-
-    task = TASKS.get(
-        task_id
-    )
+def status(task_id: str, request: Request):
+    task = TASKS.get(task_id)
 
     if not task:
-        return {
-            "status":
-            "not_found"
-        }
+        return {"status": "not_found"}
 
-    if (
-        task.get("status")
-        == "done"
-    ):
-
-        base = str(
-            request.base_url
-        ).rstrip("/")
-
-        task[
-            "download_url"
-        ] = (
-            f"{base}/files/"
-            f"{task['file']}"
-        )
-
-        elapsed = (
-            time.time()
-            -
-            task.get(
-                "completed_at",
-                0
-            )
-        )
-
-        task[
-            "seconds_until_deletion"
-        ] = max(
-            0,
-            int(
-                RETENTION_TIME
-                - elapsed
-            )
-        )
+    if task.get("status") == "done":
+        base = str(request.base_url).rstrip("/")
+        task["download_url"] = f"{base}/files/{task['file']}"
+        
+        elapsed = time.time() - task.get("completed_at", 0)
+        task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - elapsed))
 
     return task
 
@@ -803,24 +524,11 @@ def status(
 @app.get("/")
 def home():
     return {
-        "service":
-        "ai-video-api",
-        "status":
-        "running"
+        "service": "ai-video-api",
+        "status": "running"
     }
 
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
