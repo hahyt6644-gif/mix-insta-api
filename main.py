@@ -3,46 +3,42 @@ import os
 import threading
 import time
 import subprocess
-import uvicorn
-import urllib.request
-import urllib.parse
-import urllib.error
 import json
+import requests
+import uvicorn
+
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI()
 
-# ---------- TELEGRAM CREDENTIALS ----------
-# For production, it is highly recommended to store these as Environment Variables on Render
-BOT_TOKEN = "7937328325:AAEOJ3XiyvwZNCVReclkEfpj80BmJoMyngw"
-CHAT_ID = "6931296977"
+app = FastAPI()
 
 # ---------- PATHS ----------
 FFMPEG = "./ffmpeg" if os.path.exists("./ffmpeg") else "ffmpeg"
 FFPROBE = "./ffprobe" if os.path.exists("./ffprobe") else "ffprobe"
 
-UPLOAD_DIR = "Upload"
-MEME_DIR = "meme"
-OUTPUT_DIR = "."
-RETENTION_TIME = 600  # 10 minutes
+UPLOAD_DIR = "uploads"
+OUTPUT_DIR = "outputs"
+RETENTION_TIME = 600
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(MEME_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-app.mount("/files", StaticFiles(directory=".", html=False), name="files")
+app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 # ---------- TASK STORE ----------
 TASKS = {}
 
-# ---------- INPUT MODEL ----------
+# ---------- INPUT ----------
 class Job(BaseModel):
     main_url: str
-    meme_url: str
+    ref_audio_url: str
+    voice_api: str
+
 
 # ---------- HELPERS ----------
-def run_cmd(cmd, timeout=300):
+def run_cmd(cmd, timeout=600):
     return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -52,197 +48,725 @@ def run_cmd(cmd, timeout=300):
         check=True
     )
 
-def download_via_telegram(url, dest):
-    """Fallback: Asks Telegram to fetch the URL, bypass the block, and serve the file."""
-    # 1. Ask Telegram to fetch the video and send it to your chat
-    send_api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'video': url}).encode('utf-8')
-    req = urllib.request.Request(send_api, data=data)
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            res_data = json.loads(response.read().decode())
-    except urllib.error.HTTPError as e:
-        error_info = e.read().decode()
-        raise Exception(f"Telegram API blocked the fetch (File > 20MB or Dead Link): {error_info}")
-    
-    message_id = res_data['result']['message_id']
-    
-    # Check if Telegram saw it as a video or a generic document
-    if 'video' in res_data['result']:
-        file_id = res_data['result']['video']['file_id']
-    elif 'document' in res_data['result']:
-        file_id = res_data['result']['document']['file_id']
-    else:
-        raise Exception("Telegram downloaded the URL but could not process it as a video.")
 
-    # 2. Ask Telegram for the direct download path
-    get_file_api = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
-    try:
-        with urllib.request.urlopen(get_file_api) as response:
-            file_data = json.loads(response.read().decode())
-            file_path = file_data['result']['file_path']
-    except Exception as e:
-        raise Exception(f"Failed to get file path from Telegram: {str(e)}")
+def smart_download(url, dest):
+    run_cmd([
+        "curl",
+        "-L",
+        "-o",
+        dest,
+        "--silent",
+        "--show-error",
+        url
+    ])
 
-    # 3. Download the actual file from Telegram's high-speed servers
-    download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", download_url], timeout=180)
 
-    # 4. Clean up your chat instantly so it doesn't get spammed
-    delete_api = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
-    del_data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'message_id': message_id}).encode('utf-8')
+def get_duration(path):
+    r = subprocess.run(
+        [
+            FFPROBE,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
     try:
-        urllib.request.urlopen(urllib.request.Request(delete_api, data=del_data))
+        return float(r.stdout.strip())
+    except:
+        return 0
+
+
+def extract_audio(video_path, out_audio):
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "mp3",
+        out_audio
+    ])
+
+
+def transcribe_audio(audio_path):
+    with open(audio_path, "rb") as f:
+        r = requests.post(
+            "https://transcription.itz-dev.workers.dev/",
+            data=f.read(),
+            timeout=300
+        )
+
+    data = r.json()
+
+    if "text" not in data:
+        raise Exception("Transcription failed")
+
+    return data["text"]
+
+
+def generate_voice(
+    voice_api,
+    transcript,
+    ref_audio_path
+):
+    with open(ref_audio_path, "rb") as f:
+        files = {
+            "ref_audio": f
+        }
+
+        data = {
+            "text": transcript,
+            "language": "Hindi",
+            "speed": "1.0",
+            "guidance_scale": "2",
+            "num_step": "32",
+            "denoise": "true",
+            "preprocess_prompt": "true",
+            "postprocess_output": "true"
+        }
+
+        r = requests.post(
+            voice_api,
+            files=files,
+            data=data,
+            timeout=600
+        )
+
+    j = r.json()
+
+    if not j.get("success"):
+        raise Exception("Voice generation failed")
+
+    return j["audio_url"]
+
+
+def speed_audio(input_audio, output_audio, speed):
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-i", input_audio,
+        "-filter:a",
+        f"atempo={speed}",
+        output_audio
+    ]) 
+    # ---------- VIDEO HELPERS ----------
+def speed_video(input_video, output_video, speed):
+    """
+    speed < 1.0 = slow
+    speed > 1.0 = fast
+    """
+    setpts = 1 / speed
+
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-i", input_video,
+        "-filter:v",
+        f"setpts={setpts}*PTS",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        output_video
+    ])
+
+
+def trim_video(input_path, start, duration, output_path):
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-ss", str(start),
+        "-i", input_path,
+        "-t", str(duration),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ])
+
+
+def concat_videos(video_list, output_path):
+    txt_path = output_path + ".txt"
+
+    with open(txt_path, "w") as f:
+        for v in video_list:
+            f.write(f"file '{os.path.abspath(v)}'\n")
+
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", txt_path,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ])
+
+    try:
+        os.remove(txt_path)
     except:
         pass
 
-def is_valid_video(path):
-    """Checks if the downloaded file is actually a playable video file."""
-    try:
-        r = subprocess.run(
-            [FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+
+def merge_audio_video(video_path, audio_path, output_path):
+    run_cmd([
+        FFMPEG,
+        "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        output_path
+    ])
+
+
+def process_duration_logic(task_id, video_path, voice_audio):
+    """
+    Main timing logic:
+    - preserve last 5 sec
+    - slow video first (0.85–0.95)
+    - speed audio second (1.0–1.10)
+    - filler clip if needed
+    """
+
+    temp_dir = os.path.join(
+        UPLOAD_DIR,
+        task_id
+    )
+
+    os.makedirs(temp_dir, exist_ok=True)
+
+    video_duration = get_duration(video_path)
+    audio_duration = get_duration(voice_audio)
+
+    # ---------- CASE 1 ----------
+    # audio longer
+    if audio_duration > video_duration:
+
+        gap_ratio = audio_duration / video_duration
+
+        # dynamic video slow
+        if gap_ratio >= 1.35:
+            vid_speed = 0.85
+        elif gap_ratio >= 1.20:
+            vid_speed = 0.88
+        elif gap_ratio >= 1.10:
+            vid_speed = 0.92
+        else:
+            vid_speed = 0.95
+
+        slowed_video = os.path.join(
+            temp_dir,
+            "slowed.mp4"
         )
-        return bool(r.stdout.strip())
-    except:
-        return False
 
-def smart_download(url, dest, label="URL"):
-    """Downloads file and uses the Telegram Bulletproof Bypass if blocked."""
-    # 1. Try initial direct download (fastest route if no block)
-    try:
-        run_cmd(["curl", "-f", "-L", "-o", dest, "--silent", "--show-error", url], timeout=180)
-    except subprocess.CalledProcessError:
-        pass 
-    
-    # 2. Check if we got a valid video
-    if os.path.exists(dest) and is_valid_video(dest):
-        return 
-        
-    # 3. If blocked or invalid, trigger Telegram Bypass
-    try:
-        if os.path.exists(dest):
-            os.remove(dest) # Remove fake blocked file
-        
-        download_via_telegram(url, dest)
-        
-        if os.path.exists(dest) and is_valid_video(dest):
-            return 
-    except Exception as bypass_error:
-        raise Exception(f"{label} Telegram bypass failed -> {str(bypass_error)}")
-            
-    # 4. If everything fails
-    raise Exception(f"{label} error: The link is dead or the file is too large for Telegram to fetch.")
-
-def ffprobe_has_audio(path):
-    try:
-        r = subprocess.run(
-            [FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        speed_video(
+            video_path,
+            slowed_video,
+            vid_speed
         )
-        return bool(r.stdout.strip())
-    except:
-        return False
 
-# ---------- CLEANUP WORKER ----------
+        slowed_duration = get_duration(
+            slowed_video
+        )
+
+        # dynamic audio speed
+        remaining_gap = (
+            audio_duration /
+            slowed_duration
+        )
+
+        audio_speed = min(
+            1.10,
+            max(1.0, remaining_gap)
+        )
+
+        sped_audio = os.path.join(
+            temp_dir,
+            "audio_sped.mp3"
+        )
+
+        speed_audio(
+            voice_audio,
+            sped_audio,
+            audio_speed
+        )
+
+        final_audio_duration = get_duration(
+            sped_audio
+        )
+
+        slowed_duration = get_duration(
+            slowed_video
+        )
+
+        # already enough
+        if slowed_duration >= final_audio_duration:
+            trimmed = os.path.join(
+                temp_dir,
+                "trimmed.mp4"
+            )
+
+            trim_video(
+                slowed_video,
+                0,
+                final_audio_duration,
+                trimmed
+            )
+
+            return trimmed, sped_audio
+
+        # ---------- filler logic ----------
+        missing = (
+            final_audio_duration -
+            slowed_duration
+        )
+
+        last5_start = max(
+            0,
+            slowed_duration - 5
+        )
+
+        before_last = os.path.join(
+            temp_dir,
+            "before_last.mp4"
+        )
+
+        trim_video(
+            slowed_video,
+            0,
+            last5_start,
+            before_last
+        )
+
+        filler = os.path.join(
+            temp_dir,
+            "filler.mp4"
+        )
+
+        trim_video(
+            slowed_video,
+            0,
+            missing,
+            filler
+        )
+
+        last5 = os.path.join(
+            temp_dir,
+            "last5.mp4"
+        )
+
+        trim_video(
+            slowed_video,
+            last5_start,
+            5,
+            last5
+        )
+
+        final_video = os.path.join(
+            temp_dir,
+            "video_ready.mp4"
+        )
+
+        concat_videos(
+            [
+                before_last,
+                filler,
+                last5
+            ],
+            final_video
+        )
+
+        return final_video, sped_audio
+
+    # ---------- CASE 2 ----------
+    # video longer
+    else:
+
+        ratio = (
+            video_duration /
+            audio_duration
+        )
+
+        if ratio >= 1.30:
+            vid_speed = 1.10
+        elif ratio >= 1.20:
+            vid_speed = 1.08
+        elif ratio >= 1.10:
+            vid_speed = 1.05
+        else:
+            vid_speed = 1.02
+
+        sped_video = os.path.join(
+            temp_dir,
+            "sped_video.mp4"
+        )
+
+        speed_video(
+            video_path,
+            sped_video,
+            vid_speed
+        )
+
+        sped_duration = get_duration(
+            sped_video
+        )
+
+        final_video = os.path.join(
+            temp_dir,
+            "trimmed_final.mp4"
+        )
+
+        trim_video(
+            sped_video,
+            0,
+            audio_duration,
+            final_video
+        )
+
+        return final_video, voice_audio
+       
+# ---------- CLEANUP ----------
 def cleanup_worker():
     while True:
         now = time.time()
         to_delete = []
+
         for task_id, info in list(TASKS.items()):
-            if info.get("status") == "done" and info.get("completed_at"):
-                if now - info["completed_at"] > RETENTION_TIME:
-                    file_path = os.path.join(OUTPUT_DIR, info["file"])
-                    if os.path.exists(file_path):
-                        try: os.remove(file_path)
-                        except: pass
+
+            if (
+                info.get("status") == "done"
+                and info.get("completed_at")
+            ):
+
+                elapsed = (
+                    now -
+                    info["completed_at"]
+                )
+
+                if elapsed > RETENTION_TIME:
+
+                    file_path = os.path.join(
+                        OUTPUT_DIR,
+                        info["file"]
+                    )
+
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except:
+                        pass
+
+                    task_folder = os.path.join(
+                        UPLOAD_DIR,
+                        task_id
+                    )
+
+                    try:
+                        if os.path.exists(task_folder):
+                            for f in os.listdir(task_folder):
+                                try:
+                                    os.remove(
+                                        os.path.join(
+                                            task_folder,
+                                            f
+                                        )
+                                    )
+                                except:
+                                    pass
+
+                            os.rmdir(task_folder)
+                    except:
+                        pass
+
                     to_delete.append(task_id)
-            elif info.get("status") == "failed" and now - info["created"] > RETENTION_TIME:
-                to_delete.append(task_id)
+
         for tid in to_delete:
             del TASKS[tid]
+
         time.sleep(30)
 
-threading.Thread(target=cleanup_worker, daemon=True).start()
+
+threading.Thread(
+    target=cleanup_worker,
+    daemon=True
+).start()
+
 
 # ---------- WORKER ----------
-def process_task(task_id, main_url, meme_url):
-    main_path = f"{UPLOAD_DIR}/main_{task_id}.mp4"
-    meme_path = f"{MEME_DIR}/meme_{task_id}.mp4"
-    output = f"final_{task_id}.mp4"
-    output_full_path = os.path.join(OUTPUT_DIR, output)
+def process_task(
+    task_id,
+    main_url,
+    ref_audio_url,
+    voice_api
+):
+
+    task_folder = os.path.join(
+        UPLOAD_DIR,
+        task_id
+    )
+
+    os.makedirs(
+        task_folder,
+        exist_ok=True
+    )
+
+    main_video = os.path.join(
+        task_folder,
+        "main.mp4"
+    )
+
+    ref_audio = os.path.join(
+        task_folder,
+        "ref.mp3"
+    )
+
+    extracted_audio = os.path.join(
+        task_folder,
+        "extract.mp3"
+    )
+
+    generated_audio = os.path.join(
+        task_folder,
+        "generated.wav"
+    )
+
+    output_name = (
+        f"final_{task_id}.mp4"
+    )
+
+    final_output = os.path.join(
+        OUTPUT_DIR,
+        output_name
+    )
 
     try:
-        TASKS[task_id]["status"] = "processing"
 
-        smart_download(main_url, main_path, "MAIN_URL")
-        smart_download(meme_url, meme_path, "MEME_URL")
+        TASKS[task_id][
+            "status"
+        ] = "processing"
 
-        has_audio_0 = ffprobe_has_audio(main_path)
-        has_audio_1 = ffprobe_has_audio(meme_path)
-
-        filter_complex = (
-            "[0:v]scale=1080:-2[vid];" 
-            "[1:v]scale=1080:-2[meme];"
-            "color=s=1080x1920:c=black[bg];"
-            "[bg][meme]overlay=x=0:y=0[temp];"
-            "[temp][vid]overlay=x=0:y=(1920-h)/2+250[v]"
+        # download files
+        smart_download(
+            main_url,
+            main_video
         )
 
-        audio_part = ""
-        if has_audio_0 and has_audio_1:
-            filter_complex += ";[0:a][1:a]amix=inputs=2:duration=first[a]"
-            audio_part = "[a]"
-        elif has_audio_0:
-            audio_part = "0:a"
-        elif has_audio_1:
-            audio_part = "1:a"
+        smart_download(
+            ref_audio_url,
+            ref_audio
+        )
 
-        cmd = [FFMPEG, "-y", "-i", main_path, "-i", meme_path, "-filter_complex", filter_complex, "-map", "[v]"]
-        if audio_part:
-            cmd.extend(["-map", audio_part, "-c:a", "aac"])
-        
-        cmd.extend(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-shortest", output_full_path])
+        # extract main audio
+        extract_audio(
+            main_video,
+            extracted_audio
+        )
 
-        run_cmd(cmd)
+        # transcription
+        transcript = (
+            transcribe_audio(
+                extracted_audio
+            )
+        )
 
-        TASKS[task_id].update({"status": "done", "file": output, "completed_at": time.time()})
+        TASKS[task_id][
+            "transcript"
+        ] = transcript
+
+        # generate voice
+        voice_url = (
+            generate_voice(
+                voice_api,
+                transcript,
+                ref_audio
+            )
+        )
+
+        smart_download(
+            voice_url,
+            generated_audio
+        )
+
+        # duration logic
+        final_video,
+        final_audio = (
+            process_duration_logic(
+                task_id,
+                main_video,
+                generated_audio
+            )
+        )
+
+        # merge final
+        merge_audio_video(
+            final_video,
+            final_audio,
+            final_output
+        )
+
+        TASKS[
+            task_id
+        ].update({
+            "status":
+            "done",
+            "file":
+            output_name,
+            "completed_at":
+            time.time()
+        })
 
     except subprocess.CalledProcessError as e:
-        error_msg = e.stdout if e.stdout else str(e)
-        if len(error_msg) > 1000:
-            error_msg = "..." + error_msg[-1000:]
-        TASKS[task_id].update({"status": "failed", "error": f"FFmpeg Error: {error_msg}"})
+
+        error_msg = (
+            e.stdout
+            if e.stdout
+            else str(e)
+        )
+
+        TASKS[
+            task_id
+        ].update({
+            "status":
+            "failed",
+            "error":
+            error_msg[-1500:]
+        })
+
     except Exception as e:
-        TASKS[task_id].update({"status": "failed", "error": str(e)})
-    finally:
-        for f in (main_path, meme_path):
-            if os.path.exists(f): os.remove(f)
+
+        TASKS[
+            task_id
+        ].update({
+            "status":
+            "failed",
+            "error":
+            str(e)
+        })
+
 
 # ---------- API ----------
 @app.post("/start")
 def start(job: Job):
-    task_id = str(uuid.uuid4())
-    TASKS[task_id] = {"status": "queued", "created": time.time()}
-    threading.Thread(target=process_task, args=(task_id, job.main_url, job.meme_url), daemon=True).start()
-    return {"status": "queued", "task_id": task_id}
+
+    task_id = str(
+        uuid.uuid4()
+    )
+
+    TASKS[
+        task_id
+    ] = {
+        "status":
+        "queued",
+        "created":
+        time.time()
+    }
+
+    threading.Thread(
+        target=process_task,
+        args=(
+            task_id,
+            job.main_url,
+            job.ref_audio_url,
+            job.voice_api
+        ),
+        daemon=True
+    ).start()
+
+    return {
+        "status":
+        "queued",
+        "task_id":
+        task_id
+    }
+
 
 @app.get("/status/{task_id}")
-def status(task_id: str, request: Request):
-    task = TASKS.get(task_id)
-    if not task: return {"status": "not_found"}
-    if task.get("status") == "done":
-        base = str(request.base_url).rstrip("/")
-        task["download_url"] = f"{base}/files/{task['file']}"
-        elapsed = time.time() - task.get("completed_at", 0)
-        task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - elapsed))
+def status(
+    task_id: str,
+    request: Request
+):
+
+    task = TASKS.get(
+        task_id
+    )
+
+    if not task:
+        return {
+            "status":
+            "not_found"
+        }
+
+    if (
+        task.get("status")
+        == "done"
+    ):
+
+        base = str(
+            request.base_url
+        ).rstrip("/")
+
+        task[
+            "download_url"
+        ] = (
+            f"{base}/files/"
+            f"{task['file']}"
+        )
+
+        elapsed = (
+            time.time()
+            -
+            task.get(
+                "completed_at",
+                0
+            )
+        )
+
+        task[
+            "seconds_until_deletion"
+        ] = max(
+            0,
+            int(
+                RETENTION_TIME
+                - elapsed
+            )
+        )
+
     return task
+
 
 @app.get("/")
 def home():
-    return {"service": "mix-insta-api", "status": "running", "bypass": "telegram-enabled"}
+    return {
+        "service":
+        "ai-video-api",
+        "status":
+        "running"
+    }
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
+    
