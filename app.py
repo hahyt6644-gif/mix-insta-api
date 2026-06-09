@@ -389,7 +389,7 @@ def process_duration_logic(task_id, video_path, voice_audio):
 
         return final_video, sped_audio
 
-    # ---------- CASE 2 ----------
+# ---------- CASE 2 ----------
     # video longer
     else:
 
@@ -427,12 +427,19 @@ def process_duration_logic(task_id, video_path, voice_audio):
             "trimmed_final.mp4"
         )
 
-        trim_video(
-            sped_video,
-            0,
-            audio_duration,
-            final_video
-        )
+        # if sped video still longer → trim
+        if sped_duration > audio_duration:
+
+            trim_video(
+                sped_video,
+                0,
+                audio_duration,
+                final_video
+            )
+
+        else:
+            # already shorter or exact
+            final_video = sped_video
 
         return final_video, voice_audio
        
