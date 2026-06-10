@@ -87,13 +87,19 @@ def generate_voice(voice_api, transcript, ref_audio_path):
         }
         r = requests.post(voice_api, files=files, data=data, timeout=600)
 
+    # Added robust error capturing so you know why the Voice API failed
+    if r.status_code != 200:
+        error_msg = r.text.strip()[:300]
+        raise Exception(f"Voice API failed (Status {r.status_code}). Reason: {error_msg}")
+
     try: j = r.json()
     except json.JSONDecodeError:
         error_snippet = r.text.strip()[:200] 
-        raise Exception(f"Voice API failed. Server returned: {error_snippet}")
+        raise Exception(f"Voice API returned invalid JSON. Server returned: {error_snippet}")
 
     if not j.get("success") and "audio_url" not in j:
         raise Exception(f"Voice generation failed: {j}")
+    
     return j.get("audio_url")
 
 def speed_audio(input_audio, output_audio, speed):
@@ -126,7 +132,6 @@ def concat_videos(video_list, output_path):
     except: pass
 
 def pre_scale_avatar(avatar_path, target_w, output_path):
-    """Scales avatar width to exactly 30% of main video width, auto-calculating height"""
     target_w = target_w if target_w % 2 == 0 else target_w - 1
     run_cmd([
         FFMPEG, "-y", "-i", avatar_path, "-vf", f"scale={target_w}:-2",
@@ -134,8 +139,6 @@ def pre_scale_avatar(avatar_path, target_w, output_path):
     ])
 
 def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_w, main_h, output_path):
-    # Proper PIP overlay: Main video is background [0:v], Avatar is [1:v].
-    # overlay=20:{main_h}-h-20 places it safely in the bottom-left corner
     cmd = [
         FFMPEG, "-y", 
         "-i", video_path, "-stream_loop", "-1", "-i", pre_scaled_avatar_path, "-i", audio_path,
@@ -278,7 +281,6 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
             main_w = width if width % 2 == 0 else width - 1
             main_h = height if height % 2 == 0 else height - 1
 
-            # Make avatar exactly 30% of the main video's width
             target_avatar_w = int(main_w * 0.30)
             pre_scale_avatar(raw_avatar, target_avatar_w, scaled_avatar)
 
@@ -297,7 +299,7 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 
 # ---------- API ----------
 @app.post("/start")
-def start(job: Job):
+def start(job: Job, request: Request):
     task_id = uuid.uuid4().hex[:21] 
     TASKS[task_id] = {"status": "queued", "created": time.time()}
 
@@ -305,7 +307,15 @@ def start(job: Job):
         target=process_task, args=(task_id, job.main_url, job.ref_audio_url, job.voice_api, job.new_avatar_url), daemon=True
     ).start()
 
-    return {"status": "queued", "task_id": task_id}
+    # Automatically generate the full status URL using the base URL of the request
+    base_url = str(request.base_url).rstrip("/")
+    status_url = f"{base_url}/status/{task_id}"
+
+    return {
+        "status": "queued", 
+        "task_id": task_id,
+        "status_url": status_url
+    }
 
 @app.get("/status/{task_id}")
 def status(task_id: str, request: Request):
