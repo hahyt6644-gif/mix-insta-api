@@ -6,6 +6,7 @@ import subprocess
 import json
 import requests
 import uvicorn
+import concurrent.futures
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
@@ -14,8 +15,8 @@ from pydantic import BaseModel
 app = FastAPI()
 
 # ---------- PATHS ----------
-FFMPEG = "./ffmpeg" if os.path.exists("./ffmpeg") else "ffmpeg"
-FFPROBE = "./ffprobe" if os.path.exists("./ffprobe") else "ffprobe"
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
@@ -28,10 +29,9 @@ app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
 
 # ---------- TASK STORE & LOCK ----------
 TASKS = {}
-# Limits processing to 1 job at a time to strictly protect Render RAM
-JOB_LOCK = threading.Semaphore(1)
+# Unlocked to 4 parallel jobs to use your Contabo VPS properly
+JOB_LOCK = threading.Semaphore(4)
 
-# ---------- INPUT ----------
 class Job(BaseModel):
     main_url: str
     ref_audio_url: str
@@ -41,12 +41,7 @@ class Job(BaseModel):
 # ---------- HELPERS ----------
 def run_cmd(cmd, timeout=600):
     return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-        check=True
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=True
     )
 
 def smart_download(url, dest):
@@ -72,7 +67,8 @@ def get_dimensions(path):
         return 1080, 1920
 
 def extract_audio(video_path, out_audio):
-    run_cmd([FFMPEG, "-y", "-threads", "1", "-i", video_path, "-vn", "-acodec", "mp3", out_audio])
+    # Removed -threads 1
+    run_cmd([FFMPEG, "-y", "-i", video_path, "-vn", "-acodec", "mp3", out_audio])
 
 def transcribe_audio(audio_path):
     with open(audio_path, "rb") as f:
@@ -91,7 +87,6 @@ def generate_voice(voice_api, transcript, ref_audio_path):
         }
         r = requests.post(voice_api, files=files, data=data, timeout=600)
 
-    # FIXED: Robust error handling for 500 Internal Server Errors
     if r.status_code != 200:
         error_msg = r.text.strip()[:300]
         raise Exception(f"Voice API failed (Status {r.status_code}). Reason: {error_msg}")
@@ -107,20 +102,21 @@ def generate_voice(voice_api, transcript, ref_audio_path):
     return j.get("audio_url")
 
 def speed_audio(input_audio, output_audio, speed):
-    run_cmd([FFMPEG, "-y", "-threads", "1", "-i", input_audio, "-filter:a", f"atempo={speed}", output_audio]) 
+    run_cmd([FFMPEG, "-y", "-i", input_audio, "-filter:a", f"atempo={speed}", output_audio]) 
 
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
     setpts = 1 / speed
+    # Removed -threads 1, changed -crf to 23 for HD quality
     run_cmd([
-        FFMPEG, "-y", "-threads", "1", "-i", input_video, "-filter:v", f"setpts={setpts}*PTS",
-        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32", "-pix_fmt", "yuv420p", output_video
+        FFMPEG, "-y", "-i", input_video, "-filter:v", f"setpts={setpts}*PTS",
+        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", output_video
     ])
 
 def trim_video(input_path, start, duration, output_path):
     run_cmd([
-        FFMPEG, "-y", "-threads", "1", "-ss", str(start), "-i", input_path, "-t", str(duration),
-        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32", "-pix_fmt", "yuv420p", output_path
+        FFMPEG, "-y", "-ss", str(start), "-i", input_path, "-t", str(duration),
+        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", output_path
     ])
 
 def concat_videos(video_list, output_path):
@@ -129,30 +125,28 @@ def concat_videos(video_list, output_path):
         for v in video_list: f.write(f"file '{os.path.abspath(v)}'\n")
 
     run_cmd([
-        FFMPEG, "-y", "-threads", "1", "-f", "concat", "-safe", "0", "-i", txt_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32", "-pix_fmt", "yuv420p", output_path
+        FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", txt_path,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", output_path
     ])
     try: os.remove(txt_path)
     except: pass
 
-# ---------- NEW LOW-RAM PRE-PROCESSING HELPERS ----------
-def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
+def pre_scale_avatar(avatar_path, target_w, output_path):
+    # Maintains aspect ratio exactly and restores quality
+    target_w = target_w if target_w % 2 == 0 else target_w - 1
     run_cmd([
-        FFMPEG, "-y", "-threads", "1", "-i", avatar_path, "-vf", f"scale={target_w}:{target_h}",
-        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32", "-r", "30", "-pix_fmt", "yuv420p", output_path
+        FFMPEG, "-y", "-i", avatar_path, "-vf", f"scale={target_w}:-2",
+        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p", output_path
     ])
 
-def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, target_width, target_height, final_height, output_path):
-    main_w = target_width
-    main_h = final_height
-    overlay_y = main_h - target_height
-
+def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_w, main_h, output_path):
+    # Restored to 23 CRF, unlocked cores, perfect PIP overlay positioning
     cmd = [
-        FFMPEG, "-y", "-threads", "1", 
+        FFMPEG, "-y", 
         "-i", video_path, "-stream_loop", "-1", "-i", pre_scaled_avatar_path, "-i", audio_path,
-        "-filter_complex", f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=0:{overlay_y}[outv]",
+        "-filter_complex", f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=20:{main_h}-h-20:shortest=1[outv]",
         "-map", "[outv]", "-map", "2:a",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-r", "30", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", output_path
     ]
     run_cmd(cmd)
@@ -245,7 +239,7 @@ threading.Thread(target=cleanup_worker, daemon=True).start()
 
 # ---------- WORKER ----------
 def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
-    start_time = time.time()  # Track total processing time
+    start_time = time.time()  
     task_folder = os.path.join(UPLOAD_DIR, task_id)
     os.makedirs(task_folder, exist_ok=True)
 
@@ -264,21 +258,20 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
         with JOB_LOCK:
             TASKS[task_id]["status"] = "processing"
 
-            smart_download(main_url, main_video)
-            smart_download(ref_audio_url, ref_audio)
-            smart_download(new_avatar_url, raw_avatar)
+            # Parallel asset download for raw speed
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                executor.submit(smart_download, main_url, main_video)
+                executor.submit(smart_download, ref_audio_url, ref_audio)
+                executor.submit(smart_download, new_avatar_url, raw_avatar)
 
+            # KEEP ORIGINAL HD DIMENSIONS
             width, height = get_dimensions(main_video)
-            if height > 960:
-                ratio = 960 / height
-                width = int(width * ratio)
-                height = 960
+            main_w = width if width % 2 == 0 else width - 1
+            main_h = height if height % 2 == 0 else height - 1
 
-            target_width = (width // 2) * 2
-            target_height = (height // 4) * 2
-            final_height = (height // 2) * 2
-
-            pre_scale_avatar(raw_avatar, target_width, target_height, scaled_avatar)
+            # Avatar is precisely 30% of main video width for perfect scaling
+            target_avatar_w = int(main_w * 0.30)
+            pre_scale_avatar(raw_avatar, target_avatar_w, scaled_avatar)
             
             try: os.remove(raw_avatar)
             except: pass
@@ -292,10 +285,10 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 
             final_video, final_audio = process_duration_logic(task_id, main_video, generated_audio)
 
-            merge_avatar_and_audio(final_video, scaled_avatar, final_audio, target_width, target_height, final_height, final_output)
+            merge_avatar_and_audio(final_video, scaled_avatar, final_audio, main_w, main_h, final_output)
 
             total_time = time.time() - start_time
-            print(f"[{task_id}] Processed low-RAM task in {total_time:.2f}s")
+            print(f"[{task_id}] Processed HD task in {total_time:.2f}s")
 
             TASKS[task_id].update({
                 "status": "done",
@@ -313,7 +306,6 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 # ---------- API ----------
 @app.post("/start")
 def start(job: Job, request: Request):
-    # FIXED: Clean task ID format
     task_id = uuid.uuid4().hex[:21]
     TASKS[task_id] = {"status": "queued", "created": time.time()}
 
@@ -321,7 +313,6 @@ def start(job: Job, request: Request):
         target=process_task, args=(task_id, job.main_url, job.ref_audio_url, job.voice_api, job.new_avatar_url), daemon=True
     ).start()
 
-    # FIXED: Return fully clickable status URL immediately
     base_url = str(request.base_url).rstrip("/")
     return {
         "status": "queued",
