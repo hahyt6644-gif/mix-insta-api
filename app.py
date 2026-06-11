@@ -67,7 +67,6 @@ def get_dimensions(path):
         return 1080, 1920
 
 def extract_audio(video_path, out_audio):
-    # Removed -threads 1
     run_cmd([FFMPEG, "-y", "-i", video_path, "-vn", "-acodec", "mp3", out_audio])
 
 def transcribe_audio(audio_path):
@@ -107,7 +106,6 @@ def speed_audio(input_audio, output_audio, speed):
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
     setpts = 1 / speed
-    # Removed -threads 1, changed -crf to 23 for HD quality
     run_cmd([
         FFMPEG, "-y", "-i", input_video, "-filter:v", f"setpts={setpts}*PTS",
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", output_video
@@ -131,20 +129,21 @@ def concat_videos(video_list, output_path):
     try: os.remove(txt_path)
     except: pass
 
-def pre_scale_avatar(avatar_path, target_w, output_path):
-    # Maintains aspect ratio exactly and restores quality
-    target_w = target_w if target_w % 2 == 0 else target_w - 1
+def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
+    # FIXED: Crops the avatar to perfectly fit the bottom half without stretching
     run_cmd([
-        FFMPEG, "-y", "-i", avatar_path, "-vf", f"scale={target_w}:-2",
+        FFMPEG, "-y", "-i", avatar_path, 
+        "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}",
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p", output_path
     ])
 
 def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_w, main_h, output_path):
-    # Restored to 23 CRF, unlocked cores, perfect PIP overlay positioning
+    # FIXED: Places the new avatar strictly at the halfway point (0 on X, half on Y)
+    overlay_y = main_h // 2
     cmd = [
         FFMPEG, "-y", 
         "-i", video_path, "-stream_loop", "-1", "-i", pre_scaled_avatar_path, "-i", audio_path,
-        "-filter_complex", f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=20:{main_h}-h-20:shortest=1[outv]",
+        "-filter_complex", f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=0:{overlay_y}:shortest=1[outv]",
         "-map", "[outv]", "-map", "2:a",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", output_path
@@ -258,20 +257,24 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
         with JOB_LOCK:
             TASKS[task_id]["status"] = "processing"
 
-            # Parallel asset download for raw speed
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 executor.submit(smart_download, main_url, main_video)
                 executor.submit(smart_download, ref_audio_url, ref_audio)
                 executor.submit(smart_download, new_avatar_url, raw_avatar)
 
-            # KEEP ORIGINAL HD DIMENSIONS
             width, height = get_dimensions(main_video)
             main_w = width if width % 2 == 0 else width - 1
             main_h = height if height % 2 == 0 else height - 1
 
-            # Avatar is precisely 30% of main video width for perfect scaling
-            target_avatar_w = int(main_w * 0.30)
-            pre_scale_avatar(raw_avatar, target_avatar_w, scaled_avatar)
+            # FIXED: Target width is now 100% of the screen, target height is 50%
+            target_avatar_w = main_w
+            target_avatar_h = main_h // 2
+            
+            # Keep dimensions even for FFmpeg encoder
+            target_avatar_w = target_avatar_w if target_avatar_w % 2 == 0 else target_avatar_w - 1
+            target_avatar_h = target_avatar_h if target_avatar_h % 2 == 0 else target_avatar_h - 1
+
+            pre_scale_avatar(raw_avatar, target_avatar_w, target_avatar_h, scaled_avatar)
             
             try: os.remove(raw_avatar)
             except: pass
