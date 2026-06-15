@@ -6,11 +6,13 @@ import subprocess
 import json
 import requests
 import uvicorn
+import shutil
 import concurrent.futures
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List, Optional
 
 app = FastAPI()
 
@@ -20,23 +22,21 @@ FFPROBE = "ffprobe"
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
-RETENTION_TIME = 600
+RETENTION_TIME = 600  # How long to keep the task status in RAM after completion
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-app.mount("/files", StaticFiles(directory=OUTPUT_DIR), name="files")
-
 # ---------- TASK STORE & LOCK ----------
 TASKS = {}
-# Unlocked to 4 parallel jobs to use your Contabo VPS properly
 JOB_LOCK = threading.Semaphore(4)
 
 class Job(BaseModel):
     main_url: str
-    ref_audio_url: str
     voice_api: str
-    new_avatar_url: str
+    script: Optional[str] = None
+    avatars: List[str]
+    audios: List[str]
 
 # ---------- HELPERS ----------
 def run_cmd(cmd, timeout=600):
@@ -103,6 +103,21 @@ def generate_voice(voice_api, transcript, ref_audio_path):
 def speed_audio(input_audio, output_audio, speed):
     run_cmd([FFMPEG, "-y", "-i", input_audio, "-filter:a", f"atempo={speed}", output_audio]) 
 
+def upload_to_tmpfiles(filepath):
+    """Uploads the final video to tmpfiles.org and returns the direct DL link."""
+    url = "https://tmpfiles.org/api/v1/upload"
+    try:
+        with open(filepath, "rb") as f:
+            # 86400 seconds = exactly 24 hours
+            r = requests.post(url, files={"file": f}, data={"expire": 86400})
+        if r.status_code == 200:
+            original_url = r.json()["data"]["url"]
+            # Convert standard link to direct download link
+            return original_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    except Exception as e:
+        print(f"Tmpfiles upload error: {e}")
+    return None
+
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
     setpts = 1 / speed
@@ -130,7 +145,6 @@ def concat_videos(video_list, output_path):
     except: pass
 
 def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
-    # FIXED: Crops the avatar to perfectly fit the bottom half without stretching
     run_cmd([
         FFMPEG, "-y", "-i", avatar_path, 
         "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}",
@@ -138,7 +152,6 @@ def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
     ])
 
 def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_w, main_h, output_path):
-    # FIXED: Places the new avatar strictly at the halfway point (0 on X, half on Y)
     overlay_y = main_h // 2
     cmd = [
         FFMPEG, "-y", 
@@ -150,8 +163,8 @@ def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_
     ]
     run_cmd(cmd)
 
-def process_duration_logic(task_id, video_path, voice_audio):
-    temp_dir = os.path.join(UPLOAD_DIR, task_id)
+def process_duration_logic(sub_id, video_path, voice_audio):
+    temp_dir = os.path.join(UPLOAD_DIR, sub_id)
     os.makedirs(temp_dir, exist_ok=True)
 
     video_duration = get_duration(video_path)
@@ -216,89 +229,107 @@ def cleanup_worker():
     while True:
         now = time.time()
         to_delete = []
-
         for task_id, info in list(TASKS.items()):
             if info.get("status") == "done" and info.get("completed_at"):
                 if now - info["completed_at"] > RETENTION_TIME:
-                    try: os.remove(os.path.join(OUTPUT_DIR, info["file"]))
-                    except: pass
-
-                    task_folder = os.path.join(UPLOAD_DIR, task_id)
-                    try:
-                        for f in os.listdir(task_folder): os.remove(os.path.join(task_folder, f))
-                        os.rmdir(task_folder)
-                    except: pass
-
                     to_delete.append(task_id)
-
-        for tid in to_delete: del TASKS[tid]
+        for tid in to_delete: 
+            del TASKS[tid]
         time.sleep(30)
 
 threading.Thread(target=cleanup_worker, daemon=True).start()
 
 # ---------- WORKER ----------
-def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
+def process_task(task_id, main_url, voice_api, script, avatars, audios):
     start_time = time.time()  
     task_folder = os.path.join(UPLOAD_DIR, task_id)
     os.makedirs(task_folder, exist_ok=True)
 
     main_video = os.path.join(task_folder, "main.mp4")
-    ref_audio = os.path.join(task_folder, "ref.mp3")
-    raw_avatar = os.path.join(task_folder, "raw_avatar.mp4")
-    scaled_avatar = os.path.join(task_folder, "scaled_avatar.mp4")
-    extracted_audio = os.path.join(task_folder, "extract.mp3")
-    generated_audio = os.path.join(task_folder, "generated.wav")
-    output_name = f"final_{task_id}.mp4"
-    final_output = os.path.join(OUTPUT_DIR, output_name)
+    main_extracted_audio = os.path.join(task_folder, "main_extract.mp3")
 
     try:
         TASKS[task_id]["status"] = "waiting_in_queue"
 
         with JOB_LOCK:
             TASKS[task_id]["status"] = "processing"
+            TASKS[task_id]["results"] = []
 
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                executor.submit(smart_download, main_url, main_video)
-                executor.submit(smart_download, ref_audio_url, ref_audio)
-                executor.submit(smart_download, new_avatar_url, raw_avatar)
+            # Step 1: Download main video once
+            smart_download(main_url, main_video)
+
+            # Step 2: Extract text (or use provided script)
+            if script:
+                transcript = script
+            else:
+                extract_audio(main_video, main_extracted_audio)
+                transcript = transcribe_audio(main_extracted_audio)
+            
+            TASKS[task_id]["transcript"] = transcript
 
             width, height = get_dimensions(main_video)
             main_w = width if width % 2 == 0 else width - 1
             main_h = height if height % 2 == 0 else height - 1
 
-            # FIXED: Target width is now 100% of the screen, target height is 50%
             target_avatar_w = main_w
             target_avatar_h = main_h // 2
-            
-            # Keep dimensions even for FFmpeg encoder
             target_avatar_w = target_avatar_w if target_avatar_w % 2 == 0 else target_avatar_w - 1
             target_avatar_h = target_avatar_h if target_avatar_h % 2 == 0 else target_avatar_h - 1
 
-            pre_scale_avatar(raw_avatar, target_avatar_w, target_avatar_h, scaled_avatar)
-            
-            try: os.remove(raw_avatar)
-            except: pass
+            # Step 3: Loop through each Avatar + Audio pair
+            for i, (avatar_url, ref_audio_url) in enumerate(zip(avatars, audios)):
+                sub_id = f"{task_id}_{i}"
+                sub_folder = os.path.join(UPLOAD_DIR, sub_id)
+                os.makedirs(sub_folder, exist_ok=True)
 
-            extract_audio(main_video, extracted_audio)
-            transcript = transcribe_audio(extracted_audio)
-            TASKS[task_id]["transcript"] = transcript
+                raw_avatar = os.path.join(sub_folder, "raw_avatar.mp4")
+                scaled_avatar = os.path.join(sub_folder, "scaled_avatar.mp4")
+                ref_audio = os.path.join(sub_folder, "ref_audio.mp3")
+                generated_audio = os.path.join(sub_folder, "generated.wav")
+                final_output = os.path.join(OUTPUT_DIR, f"final_{sub_id}.mp4")
 
-            voice_url = generate_voice(voice_api, transcript, ref_audio)
-            smart_download(voice_url, generated_audio)
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    executor.submit(smart_download, avatar_url, raw_avatar)
+                    executor.submit(smart_download, ref_audio_url, ref_audio)
 
-            final_video, final_audio = process_duration_logic(task_id, main_video, generated_audio)
+                pre_scale_avatar(raw_avatar, target_avatar_w, target_avatar_h, scaled_avatar)
+                
+                try: os.remove(raw_avatar)
+                except: pass
 
-            merge_avatar_and_audio(final_video, scaled_avatar, final_audio, main_w, main_h, final_output)
+                voice_url = generate_voice(voice_api, transcript, ref_audio)
+                smart_download(voice_url, generated_audio)
+
+                final_video, final_audio = process_duration_logic(sub_id, main_video, generated_audio)
+
+                merge_avatar_and_audio(final_video, scaled_avatar, final_audio, main_w, main_h, final_output)
+
+                # Instantly upload to Tmpfiles.org and save link
+                download_link = upload_to_tmpfiles(final_output)
+
+                TASKS[task_id]["results"].append({
+                    "pair_index": i + 1,
+                    "download_url": download_link
+                })
+
+                # IMMEDIATELY delete local files for this pair to save space
+                try: os.remove(final_output)
+                except: pass
+                try: shutil.rmtree(sub_folder)
+                except: pass
 
             total_time = time.time() - start_time
-            print(f"[{task_id}] Processed HD task in {total_time:.2f}s")
+            print(f"[{task_id}] Processed {len(avatars)} pairs in {total_time:.2f}s")
 
             TASKS[task_id].update({
                 "status": "done",
-                "file": output_name,
                 "completed_at": time.time(),
                 "time_taken": round(total_time, 2)
             })
+
+            # Clean up the main video folder
+            try: shutil.rmtree(task_folder)
+            except: pass
 
     except subprocess.CalledProcessError as e:
         error_msg = e.stdout if e.stdout else str(e)
@@ -309,11 +340,15 @@ def process_task(task_id, main_url, ref_audio_url, voice_api, new_avatar_url):
 # ---------- API ----------
 @app.post("/start")
 def start(job: Job, request: Request):
+    # Ensure they sent the same amount of avatars and audios
+    if len(job.avatars) != len(job.audios):
+        return {"status": "failed", "error": "The number of avatars and audios must match."}
+
     task_id = uuid.uuid4().hex[:21]
     TASKS[task_id] = {"status": "queued", "created": time.time()}
 
     threading.Thread(
-        target=process_task, args=(task_id, job.main_url, job.ref_audio_url, job.voice_api, job.new_avatar_url), daemon=True
+        target=process_task, args=(task_id, job.main_url, job.voice_api, job.script, job.avatars, job.audios), daemon=True
     ).start()
 
     base_url = str(request.base_url).rstrip("/")
@@ -324,20 +359,14 @@ def start(job: Job, request: Request):
     }
 
 @app.get("/status/{task_id}")
-def status(task_id: str, request: Request):
+def status(task_id: str):
     task = TASKS.get(task_id)
     if not task: return {"status": "not_found"}
-
-    if task.get("status") == "done":
-        base = str(request.base_url).rstrip("/")
-        task["download_url"] = f"{base}/files/{task['file']}"
-        task["seconds_until_deletion"] = max(0, int(RETENTION_TIME - (time.time() - task.get("completed_at", 0))))
-
     return task
 
 @app.get("/")
 def home():
-    return {"service": "ai-video-api", "status": "running"}
+    return {"service": "ai-video-api-batch", "status": "running"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
