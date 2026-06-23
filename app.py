@@ -37,6 +37,7 @@ class Job(BaseModel):
     script: Optional[str] = None
     avatars: List[str]
     audios: List[str]
+    callback_url: Optional[str] = None  # <-- NEW: optional webhook URL
 
 # ---------- HELPERS ----------
 def run_cmd(cmd, timeout=600):
@@ -77,46 +78,113 @@ def transcribe_audio(audio_path):
     return data.get("text", "")
 
 def generate_voice(voice_api, transcript, ref_audio_path):
+    # --- Reliability checks ---
+    if not os.path.exists(ref_audio_path):
+        raise Exception(f"Reference audio not found: {ref_audio_path}")
+
+    file_size = os.path.getsize(ref_audio_path)
+
+    print(f"[VOICE] API: {voice_api}")
+    print(f"[VOICE] Audio: {ref_audio_path}")
+    print(f"[VOICE] Size: {file_size} bytes")
+
+    if file_size < 1000:
+        raise Exception(f"Downloaded audio appears invalid ({file_size} bytes)")
+
+    headers = {
+        "X-Pinggy-No-Screen": "1"
+    }
+
     with open(ref_audio_path, "rb") as f:
         files = {"ref_audio": f}
         data = {
-            "text": transcript, "language": "Hindi", "speed": "1.0",
-            "guidance_scale": "2", "num_step": "32", "denoise": "true",
-            "preprocess_prompt": "true", "postprocess_output": "true"
+            "text": transcript,
+            "language": "Hindi",
+            "speed": "1.0",
+            "guidance_scale": "2",
+            "num_step": "32",
+            "denoise": "true",
+            "preprocess_prompt": "true",
+            "postprocess_output": "true"
         }
-        r = requests.post(voice_api, files=files, data=data, timeout=600)
+        r = requests.post(
+            voice_api,
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=600
+        )
+
+    print(f"[VOICE] Status: {r.status_code}")
+    print(f"[VOICE] Response: {r.text[:1000]}")
 
     if r.status_code != 200:
-        error_msg = r.text.strip()[:300]
-        raise Exception(f"Voice API failed (Status {r.status_code}). Reason: {error_msg}")
+        raise Exception(
+            f"Voice API failed (Status {r.status_code}). Reason: {r.text[:1000]}"
+        )
 
-    try: j = r.json()
-    except json.JSONDecodeError:
-        error_snippet = r.text.strip()[:200]
-        raise Exception(f"Voice API returned invalid JSON. Server returned: {error_snippet}")
+    try:
+        j = r.json()
+    except Exception:
+        raise Exception(
+            f"Voice API returned invalid JSON: {r.text[:500]}"
+        )
 
-    if not j.get("success") and "audio_url" not in j:
-        raise Exception(f"Voice generation failed: {j}")
-    
-    return j.get("audio_url")
+    if not j.get("audio_url"):
+        raise Exception(f"Voice API returned no audio_url: {j}")
+
+    return j["audio_url"]
 
 def speed_audio(input_audio, output_audio, speed):
-    run_cmd([FFMPEG, "-y", "-i", input_audio, "-filter:a", f"atempo={speed}", output_audio]) 
+    run_cmd([FFMPEG, "-y", "-i", input_audio, "-filter:a", f"atempo={speed}", output_audio])
 
 def upload_to_tmpfiles(filepath):
     """Uploads the final video to tmpfiles.org and returns the direct DL link."""
     url = "https://tmpfiles.org/api/v1/upload"
     try:
         with open(filepath, "rb") as f:
-            # 86400 seconds = exactly 24 hours
             r = requests.post(url, files={"file": f}, data={"expire": 86400})
         if r.status_code == 200:
             original_url = r.json()["data"]["url"]
-            # Convert standard link to direct download link
             return original_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
     except Exception as e:
         print(f"Tmpfiles upload error: {e}")
     return None
+
+# ---------- CALLBACK ----------
+def fire_callback(callback_url, task_id, results):
+    """
+    POST to callback_url with task_id and all video results.
+    Payload shape:
+    {
+        "task_id": "...",
+        "status": "done",
+        "videos": {
+            "video1": "https://...",
+            "video2": "https://...",
+            ...
+        }
+    }
+    """
+    if not callback_url:
+        return
+
+    videos = {}
+    for item in results:
+        key = f"video{item['pair_index']}"
+        videos[key] = item.get("download_url")
+
+    payload = {
+        "task_id": task_id,
+        "status": "done",
+        "videos": videos
+    }
+
+    try:
+        r = requests.post(callback_url, json=payload, timeout=30)
+        print(f"[CALLBACK] POST {callback_url} → {r.status_code}")
+    except Exception as e:
+        print(f"[CALLBACK] Failed to fire callback: {e}")
 
 # ---------- VIDEO HELPERS ----------
 def speed_video(input_video, output_video, speed):
@@ -146,7 +214,7 @@ def concat_videos(video_list, output_path):
 
 def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
     run_cmd([
-        FFMPEG, "-y", "-i", avatar_path, 
+        FFMPEG, "-y", "-i", avatar_path,
         "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}",
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p", output_path
     ])
@@ -154,7 +222,7 @@ def pre_scale_avatar(avatar_path, target_w, target_h, output_path):
 def merge_avatar_and_audio(video_path, pre_scaled_avatar_path, audio_path, main_w, main_h, output_path):
     overlay_y = main_h // 2
     cmd = [
-        FFMPEG, "-y", 
+        FFMPEG, "-y",
         "-i", video_path, "-stream_loop", "-1", "-i", pre_scaled_avatar_path, "-i", audio_path,
         "-filter_complex", f"[0:v]scale={main_w}:{main_h}[main];[main][1:v]overlay=0:{overlay_y}:shortest=1[outv]",
         "-map", "[outv]", "-map", "2:a",
@@ -176,14 +244,14 @@ def process_duration_logic(sub_id, video_path, voice_audio):
 
         slowed_video = os.path.join(temp_dir, "slowed.mp4")
         speed_video(video_path, slowed_video, vid_speed)
-        
+
         slowed_duration = get_duration(slowed_video)
         remaining_gap = audio_duration / slowed_duration
         audio_speed = min(1.10, max(1.0, remaining_gap))
 
         sped_audio = os.path.join(temp_dir, "audio_sped.mp3")
         speed_audio(voice_audio, sped_audio, audio_speed)
-        
+
         final_audio_duration = get_duration(sped_audio)
 
         if slowed_duration >= final_audio_duration:
@@ -223,7 +291,7 @@ def process_duration_logic(sub_id, video_path, voice_audio):
             final_video = sped_video
 
         return final_video, voice_audio
-       
+
 # ---------- CLEANUP ----------
 def cleanup_worker():
     while True:
@@ -233,15 +301,15 @@ def cleanup_worker():
             if info.get("status") == "done" and info.get("completed_at"):
                 if now - info["completed_at"] > RETENTION_TIME:
                     to_delete.append(task_id)
-        for tid in to_delete: 
+        for tid in to_delete:
             del TASKS[tid]
         time.sleep(30)
 
 threading.Thread(target=cleanup_worker, daemon=True).start()
 
 # ---------- WORKER ----------
-def process_task(task_id, main_url, voice_api, script, avatars, audios):
-    start_time = time.time()  
+def process_task(task_id, main_url, voice_api, script, avatars, audios, callback_url):
+    start_time = time.time()
     task_folder = os.path.join(UPLOAD_DIR, task_id)
     os.makedirs(task_folder, exist_ok=True)
 
@@ -264,7 +332,7 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
             else:
                 extract_audio(main_video, main_extracted_audio)
                 transcript = transcribe_audio(main_extracted_audio)
-            
+
             TASKS[task_id]["transcript"] = transcript
 
             width, height = get_dimensions(main_video)
@@ -288,12 +356,40 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
                 generated_audio = os.path.join(sub_folder, "generated.wav")
                 final_output = os.path.join(OUTPUT_DIR, f"final_{sub_id}.mp4")
 
+                # Store debug info in status so failures are traceable
+                TASKS[task_id]["last_pair_index"] = i + 1
+                TASKS[task_id]["last_avatar_url"] = avatar_url
+                TASKS[task_id]["last_audio_url"] = ref_audio_url
+                TASKS[task_id]["last_voice_api"] = voice_api
+
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     executor.submit(smart_download, avatar_url, raw_avatar)
                     executor.submit(smart_download, ref_audio_url, ref_audio)
 
+                # --- Reference audio reliability checks ---
+                if not os.path.exists(ref_audio):
+                    raise Exception(f"Audio download failed: {ref_audio_url}")
+
+                audio_size = os.path.getsize(ref_audio)
+                print(f"[AUDIO] URL: {ref_audio_url}")
+                print(f"[AUDIO] Saved: {ref_audio}")
+                print(f"[AUDIO] Size: {audio_size} bytes")
+
+                if audio_size < 1000:
+                    raise Exception(
+                        f"Downloaded audio invalid. URL={ref_audio_url} Size={audio_size} bytes"
+                    )
+
+                audio_duration = get_duration(ref_audio)
+                print(f"[AUDIO] Duration: {audio_duration}s")
+
+                if audio_duration <= 0:
+                    raise Exception(
+                        f"Downloaded audio appears corrupted (duration=0). URL={ref_audio_url}"
+                    )
+
                 pre_scale_avatar(raw_avatar, target_avatar_w, target_avatar_h, scaled_avatar)
-                
+
                 try: os.remove(raw_avatar)
                 except: pass
 
@@ -304,7 +400,7 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
 
                 merge_avatar_and_audio(final_video, scaled_avatar, final_audio, main_w, main_h, final_output)
 
-                # Instantly upload to Tmpfiles.org and save link
+                # Upload to Tmpfiles.org and save link
                 download_link = upload_to_tmpfiles(final_output)
 
                 TASKS[task_id]["results"].append({
@@ -312,7 +408,7 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
                     "download_url": download_link
                 })
 
-                # IMMEDIATELY delete local files for this pair to save space
+                # Delete local files for this pair immediately to save space
                 try: os.remove(final_output)
                 except: pass
                 try: shutil.rmtree(sub_folder)
@@ -331,6 +427,9 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
             try: shutil.rmtree(task_folder)
             except: pass
 
+            # Fire the callback webhook if provided
+            fire_callback(callback_url, task_id, TASKS[task_id]["results"])
+
     except subprocess.CalledProcessError as e:
         error_msg = e.stdout if e.stdout else str(e)
         TASKS[task_id].update({"status": "failed", "error": error_msg[-1500:]})
@@ -340,7 +439,6 @@ def process_task(task_id, main_url, voice_api, script, avatars, audios):
 # ---------- API ----------
 @app.post("/start")
 def start(job: Job, request: Request):
-    # Ensure they sent the same amount of avatars and audios
     if len(job.avatars) != len(job.audios):
         return {"status": "failed", "error": "The number of avatars and audios must match."}
 
@@ -348,7 +446,9 @@ def start(job: Job, request: Request):
     TASKS[task_id] = {"status": "queued", "created": time.time()}
 
     threading.Thread(
-        target=process_task, args=(task_id, job.main_url, job.voice_api, job.script, job.avatars, job.audios), daemon=True
+        target=process_task,
+        args=(task_id, job.main_url, job.voice_api, job.script, job.avatars, job.audios, job.callback_url),
+        daemon=True
     ).start()
 
     base_url = str(request.base_url).rstrip("/")
